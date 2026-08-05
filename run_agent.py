@@ -1,7 +1,14 @@
+from typing import Any
 from urllib.parse import urlparse, urlunparse
-
 from utils import base_url_hostname
 
+from agent.process_bootstrap import (
+    OpenAI,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.OpenAI")
+    _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
+    _get_proxy_for_base_url,
+)
+import logging
+logger = logging.getLogger(__name__)
 class AIAgent:
     
         
@@ -17,12 +24,15 @@ class AIAgent:
         
         
         
-    def __init__(self,base_url:str = None,api_model:str = None,api_key:str = None,provider:str = None,model:str = None,quiet_mode:bool = False):
+    def __init__(self,base_url:str = None,api_mode:str = None,api_key:str = None,provider:str = None,model:str = None,quiet_mode:bool = False):
         
         from agent.agent_init import init_agent
-        init_agent(self,base_url= base_url,api_key=api_key, provider= provider,api_model=api_model,model=model,quiet_mode= quiet_mode)
+        init_agent(self,base_url= base_url,api_key=api_key, provider= provider,api_mode=api_mode,model=model,quiet_mode= quiet_mode)
         
-
+    def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+        """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
+        from agent.agent_runtime_helpers import create_openai_client
+        return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
 
 
 def main(query: str = None,

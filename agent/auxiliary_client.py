@@ -1,6 +1,22 @@
+from typing import Any, Dict, Optional, Tuple
+
 from utils import normalize_proxy_env_vars
 import os
 
+
+
+def resolve_provider_client(provider: str,
+    model: str = None,
+    async_mode: bool = False,
+    raw_codex: bool = False,
+    explicit_base_url: str = None,
+    explicit_api_key: str = None,
+    api_mode: str = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    is_vision: bool = False,
+    task: Optional[str] = None,)->Tuple[Optional[Any], Optional[str]]:
+    
+    _validate_proxy_env_urls()
 
 def _validate_base_url(base_url: str) -> None:
     """验证base_url"""
