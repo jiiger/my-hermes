@@ -1,0 +1,13 @@
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+
+# 密钥文件（含 API key）
+.env
+
+# 日志
+*.log

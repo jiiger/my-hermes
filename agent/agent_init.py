@@ -11,11 +11,14 @@ def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,
         quiet_mode:安静模式
     """
     #TODO _install_safe_stdio()
+    from agent.process_bootstrap import _install_safe_stdio
+    _install_safe_stdio()
     
     agent.model = model
     agent.quiet_mode = quiet_mode
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
+    agent.provider = provider_name or ""
     
     
     #TODO 按api_mode做分类，默认chat_completion(openAi兼容客户端)
@@ -51,7 +54,7 @@ def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,
                     "default_query": _query_params,
                 }
             else:
-                client_kwargs = client_kwargs = {"api_key": api_key, "base_url": base_url}
+                client_kwargs = {"api_key": api_key, "base_url": base_url}
                 
                 
             #TODO 超时设置：如果用户配置了provider 级别的超时时间，注入到客户端参数
@@ -59,7 +62,10 @@ def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,
             
             #TODO 按host匹配注入 Provider 专属 Headers
             #TODO Fallback：从 Provider Profile 读取默认 Headers
-            
+    else:
+        # 无显式凭据 → 空 kwargs 兜底（原版走 provider router，裁剪版不路由）
+        client_kwargs = {}
+
     agent._client_kwargs = client_kwargs
             
         
@@ -78,9 +84,6 @@ def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,
         #TODO 验证
     except Exception as e:
         raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
-        
-    from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-    #TODO sync_credential_pool_entry_id(agent)
         
     #TODO 。。。。。。
         
