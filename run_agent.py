@@ -1,17 +1,14 @@
-from typing import Any
-from urllib.parse import urlparse, urlunparse
+import logging
+from typing import Any, Dict, List, Optional
+
+from agent.process_bootstrap import _get_proxy_for_base_url
+
 from utils import base_url_hostname
 
-from agent.process_bootstrap import (
-    OpenAI,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.OpenAI")
-    _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
-    _get_proxy_for_base_url,
-)
-import logging
 logger = logging.getLogger(__name__)
+
+
 class AIAgent:
-    
-        
     @property
     def base_url(self) -> str:
         return self._base_url
@@ -21,17 +18,35 @@ class AIAgent:
         self._base_url = value
         self._base_url_lower = value.lower() if value else ""
         self._base_url_hostname = base_url_hostname(value)
-        
-        
-        
-    def __init__(self,base_url:str = None,api_mode:str = None,api_key:str = None,provider:str = None,model:str = None,quiet_mode:bool = False):
-        
+
+    def __init__(
+        self,
+        base_url: str = None,
+        api_mode: str = None,
+        api_key: str = None,
+        provider: str = None,
+        model: str = None,
+        quiet_mode: bool = False,
+    ):
+
         from agent.agent_init import init_agent
-        init_agent(self,base_url= base_url,api_key=api_key, provider= provider,api_mode=api_mode,model=model,quiet_mode= quiet_mode)
-        
-    def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+
+        init_agent(
+            self,
+            base_url=base_url,
+            api_key=api_key,
+            provider=provider,
+            api_mode=api_mode,
+            model=model,
+            quiet_mode=quiet_mode,
+        )
+
+    def _create_openai_client(
+        self, client_kwargs: dict, *, reason: str, shared: bool
+    ) -> Any:
         """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
         from agent.agent_runtime_helpers import create_openai_client
+
         return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
 
     @staticmethod
@@ -76,51 +91,96 @@ class AIAgent:
         base_url = getattr(self, "base_url", "unknown")
         model = getattr(self, "model", "unknown")
         return f"provider={provider} base_url={base_url} model={model}"
+    
+    
+    
+    def run_conversation(self,
+        user_message: Any,
+        system_message: str = None,
+        conversation_history: List[Dict[str, Any]] = None,
+        task_id: str = None,
+        stream_callback: Optional[callable] = None,
+        persist_user_message: Optional[Any] = None,
+        persist_user_timestamp: Optional[float] = None,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        moa_config: Optional[dict[str, Any]] = None,) -> Dict[str,any]:
+        """_summary_
+
+        Args:
+            user_message (Any): 用户当前输入
+            system_message (str, optional): 系统提示词. Defaults to None.
+            conversation_history (List[Dict[str, Any]], optional): 对话历史. Defaults to None.
+            task_id (str, optional): 单词对话任务的唯一id. Defaults to None.
+            stream_callback (Optional[callable], optional): 流式回调函数. Defaults to None.
+            persist_user_message (Optional[Any], optional): 要持久化的用户消息. Defaults to None.
+            persist_user_timestamp (Optional[float], optional): 用户消息的时间戳. Defaults to None.
+            persist_user_display_kind (Optional[str], optional): 持久化消息类型. Defaults to None.
+            persist_user_display_metadata (Optional[Dict[str, Any]], optional): _description_. Defaults to None.
+            moa_config (Optional[dict[str, Any]], optional): _description_. Defaults to None.
+
+        Returns:
+            Dict[str,any]: _description_
+        """
+            
+            effective_task_id = 
 
 
-def main(query: str = None,
+def main(
+    query: str = None,
     model: str = "",
     api_key: str = None,
-    base_url: str = "",):
-    
-    
-    
-    #TODO 可用工具分类
-    
-    
-    
-    #创建agent
+    base_url: str = "",
+):
+
+    # TODO 可用工具分类
+
+    # 创建agent
     try:
-        agent = AIAgent(
-            base_url= base_url,
-            model= model,
-            api_key = api_key
-        )
-        
+        agent = AIAgent(base_url=base_url, model=model, api_key=api_key)
+
     except RuntimeError as exc:
         print(f"Failed to initialize agent : {exc}")
-        return 
-        
+        return
+
     if query is None:
         user_query = (
             "Tell me about the latest developments in Python 3.13 and what new features "
             "developers should know about. Please search for current information and try it out."
         )
-        
+
     else:
         user_query = query
-        
+
     print(f"\n User Query : {user_query}")
-    print("\n" + "=" * 50)    
-    
-    #TODO 定义run_conversation（）
+    print("\n" + "=" * 50)
+
+    # TODO 定义run_conversation（）
     resule = agent.run_conversation(user_query)
-    
+
     if resule["final_response"]:
         print("\n🎯 FINAL RESPONSE:")
         print("-" * 30)
-        print(resule['final_response'])
-        
-    
-    
-    #TODO 保存样本轨迹
+        print(resule["final_response"])
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹
+
+    # TODO 保存样本轨迹

@@ -1,4 +1,5 @@
 """进程级引导：OpenAI 懒加载代理 + 安全 stdio + 代理 URL 解析"""
+
 import os
 import sys
 from typing import Any, Optional
@@ -15,6 +16,7 @@ def _load_openai_cls() -> type:
     global _OPENAI_CLS_CACHE
     if _OPENAI_CLS_CACHE is None:
         from openai import OpenAI as _cls
+
         _OPENAI_CLS_CACHE = _cls
     return _OPENAI_CLS_CACHE
 
@@ -77,8 +79,14 @@ class _SafeWriter:
 
 def _get_proxy_from_env() -> Optional[str]:
     """从环境变量读取代理 URL（HTTPS_PROXY → HTTP_PROXY → ALL_PROXY）。"""
-    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-                "https_proxy", "http_proxy", "all_proxy"):
+    for key in (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+    ):
         value = os.environ.get(key, "").strip()
         if value:
             return normalize_proxy_url(value)

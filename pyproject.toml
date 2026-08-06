@@ -1,0 +1,267 @@
+[project]
+name = "my-hermes"
+version = "0.1.0"
+description = "自改进型 AI 智能体——可从经验中生成技能、在使用过程中持续优化，且能在任意环境运行"
+readme = "README.md"
+authors = [{ name = "jiiger", email = "jiiger17@gmail.com" }]
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "certifi==2026.5.20",
+    "fire==0.7.1",
+    "httpx[socks]==0.28.1",
+    "openai==2.24.0",
+    "python-dotenv==1.2.2",
+    "rich==14.3.3",
+    "tenacity==9.1.4",
+    "pyyaml==6.0.3",
+    "ruamel.yaml==0.18.17",
+    "requests==2.33.0",                        # CVE-2026-25645
+    "jinja2==3.1.6",
+    "pydantic==2.13.4",
+    "prompt_toolkit==3.0.52",
+    "croniter==6.0.0",
+    "packaging==26.0",
+    "Markdown==3.10.2",
+    "PyJWT[crypto]==2.13.0",
+    "urllib3>=2.7.0,<3",
+    "cryptography==48.0.1",
+    "tzdata==2025.3; sys_platform == 'win32'",
+    # Cross-platform process / PID management.  `psutil` is the canonical
+    # answer for "is this PID alive" and process-tree walking across Linux,
+    # macOS and Windows.  It replaces POSIX-only idioms like `os.kill(pid, 0)`
+    # (which is a silent killer on Windows — see CONTRIBUTING.md) and
+    # `os.killpg` (which doesn't exist on Windows).
+    "psutil==7.2.2",
+    # Browser CDP supervisor + browser_dialog import this directly. Keep core
+    # so browser tool discovery doesn't fail on lean installs.
+    "websockets==15.0.1",
+    # .gitignore-aware file matching for desktop build stamp.
+    "pathspec==1.1.1",
+    "fastapi>=0.104.0,<1",
+    "uvicorn[standard]>=0.24.0,<1",
+    # Streaming multipart uploads for the dashboard file manager (NS-501).
+    # FastAPI's UploadFile/Form depend on python-multipart; it is NOT pulled in
+    # by fastapi itself, so the dashboard's multipart upload endpoint would 500
+    # without an explicit dependency here (and in the `web` extra below).
+    "python-multipart>=0.0.9,<1",
+    "ptyprocess>=0.7.0,<1; sys_platform != 'win32'",
+    "pywinpty>=2.0.0,<3; sys_platform == 'win32'",
+    # Desktop SSH's Windows remote runtime (hermes_cli/windows_ssh_runtime.py)
+    # imports win32security/win32file/etc. directly — declare pywin32 rather than
+    # relying on the concurrent-log-handler → portalocker transitive chain.
+    "pywin32>=306,<312; sys_platform == 'win32'",
+    # Image resize recovery for the vision tools. Pillow shrinks oversized images
+    # (>5 MB or >8000px) at embed time; without it the byte AND pixel-dimension
+    # shrink paths no-op, so an oversized image bakes into immutable history and
+    # bricks the session on Anthropic's non-retryable 400. Pure-wheel, no system
+    # libs required for the codecs we use, so it's safe to ship in the base
+    # install rather than gating it behind an extra + a mid-session lazy install
+    # (which deadlocked the CLI under prompt_toolkit — see #40490).
+    "Pillow==12.3.0",
+    # Windows log rotation. Stdlib ``RotatingFileHandler.doRollover()`` uses
+    # ``os.rename()`` which fails with ``PermissionError [WinError 32]`` on
+    # Windows whenever any other process holds an append-mode handle on
+    # ``agent.log`` (always the case in Hermes — TUI, gateway, ``hy_memory``
+    # server, MCP servers, and on-demand CLI commands all log from separate
+    # processes), pinning ``agent.log`` at the 5 MiB threshold and spamming
+    # stderr on every emit (see #44873). ``concurrent-log-handler`` wraps the
+    # rename in a cross-process file lock (via ``portalocker``: pywin32 on
+    # Windows) so only one process rotates at a time. ``hermes_logging.py``
+    # aliases it ONLY on Windows — POSIX renames an open file fine, so stdlib
+    # already works there and managed-mode perms depend on its exact lifecycle.
+    # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
+    # / pywin32 tree) ships only where it's actually used.
+    "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
+    # First-party lifecycle and shared-metrics runtime. Relay 0.6 is the minimum
+    # lossless provider-codec contract. Managed calls pass request/response data
+    # through this native module in-process; shared metrics installs no network
+    # exporter and consumes only its bounded projection. Relay publishes wheels
+    # only (no sdist), so this marker must stay false anywhere no wheel tag can
+    # match — otherwise installing Python dependencies fails resolution outright
+    # instead of falling back to the no-op Relay host (#76469, Termux).
+    # Termux Python reports plain linux/aarch64 but runs on Bionic
+    # libc, which satisfies neither manylinux nor musllinux, hence the
+    # `'android' not in platform_release` guard on the linux arms: Android GKI
+    # kernels embed "-androidNN-" in the kernel release string. (Official PEP
+    # 738 CPython reports sys_platform == 'android' and never matched.) Pre-GKI
+    # devices can still slip through; they get the same resolution failure as
+    # before, worked around by installing with `--no-deps` or an older release.
+    "nemo-relay>=0.6.0,<0.7; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')",
+]
+
+
+[project.optional-dependencies]
+
+
+exa = ["exa-py==2.10.2"]
+firecrawl = ["firecrawl-py==4.17.0"]
+parallel-web = ["parallel-web==0.4.2"]
+
+
+dev = [
+    "debugpy==1.8.20",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.3.0",
+    "mcp==1.28.1",
+    "starlette==1.3.1",
+    "ty==0.0.21",
+    "ruff==0.15.10",
+    "setuptools==83.0.0",
+] # starlette: CVE-2026-48710; setuptools: 83 (torch >=2.13 requires setuptools 83)
+
+
+mcp = ["mcp==1.28.1", "starlette==1.3.1"]
+computer-use = ["mcp==1.28.1", "starlette==1.3.1"] # starlette: CVE-2026-48710
+acp = ["agent-client-protocol==0.9.0"]
+
+all = [
+    # Policy (2026-05-12): `[all]` includes only extras that genuinely
+    # CAN'T be lazy-installed via `tools/lazy_deps.py` — i.e. things every
+    # session can use, things needed before the agent loop is alive
+    # (terminal/CLI), and skill deps that dev environments need.
+    # Anything an opt-in backend (provider, search, TTS, image, memory,
+    # messaging platform, terminal sandbox) needs MUST live exclusively in
+    # `LAZY_DEPS` and resolve at first use — otherwise one quarantined PyPI
+    # release breaks every fresh install.
+    #
+    # Removed from [all] on 2026-05-12 (covered by lazy-install):
+    #   anthropic, exa, firecrawl, parallel-web, fal, edge-tts,
+    #   modal, daytona, vercel, messaging (telegram/discord/slack),
+    #   matrix, slack, honcho, voice (faster-whisper),
+    #   dingtalk, feishu, bedrock, tts-premium (elevenlabs)
+    #
+    # Why: the matrix extra in particular pulls `mautrix[encryption]`
+    # which depends on `python-olm`. python-olm has Linux-only wheels and
+    # no native build path on Windows or modern macOS. With matrix in
+    # [all], `uv sync --locked` on Windows tried to build it from sdist
+    # and failed on `make`. Lazy-install routes that build to first use,
+    # where the user is expected to have a toolchain available.
+    #"my-hermes[cron]",
+    #"my-hermes[cli]",
+    #"my-hermes[pty]",
+    "my-hermes[mcp]",
+    #"my-hermes[homeassistant]",
+    "my-hermes[sms]",
+    "my-hermes[acp]",
+    #"my-hermes[google]",
+    #"my-hermes[web]",
+    #"my-hermes[youtube]",
+    "my-hermes[dev]",
+]
+
+
+[project.scripts]
+#hermes = "hermes_cli.main:main"
+hermes-agent = "run_agent:main"
+#hermes-acp = "acp_adapter.entry:main"
+
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+
+[tool.uv]
+override-dependencies = [
+    # discord.py's latest published version, 2.7.1, pins pynacl at <1.6. however, pynacl 1.5.0 has known vulnerabilities.
+    # discord.py has updated pynacl to 1.6 on `main`, but has not yet published a patch release.
+    # so, we force-override this to pynacl 1.6. here.
+    # remove this when we update discord.py
+    "pynacl>=1.6,<1.7",
+]
+exclude-newer = "14 days"
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false }
+
+[tool.setuptools]
+# Top-level single-file modules (not packages). Without this, uv2nix's
+# sealed venv is missing hermes_constants, run_agent, etc.
+py-modules = [
+    "run_agent",
+    "model_tools",
+    "toolsets",
+    "batch_runner",
+    "trajectory_compressor",
+    "toolset_distributions",
+    "cli",
+    "hermes_bootstrap",
+    "hermes_constants",
+    "hermes_state",
+    "hermes_state_common",
+    "hermes_state_portability",
+    "hermes_state_schema",
+    "hermes_state_search",
+    "hermes_time",
+    "hermes_logging",
+    "utils",
+    "mcp_serve",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "agent",
+    "agent.*",
+    "tools",
+    "tools.*",
+    "hermes_cli",
+    "hermes_cli.*",
+    "gateway",
+    "gateway.*",
+    "tui_gateway",
+    "tui_gateway.*",
+    "cron",
+    "cron.*",
+    "acp_adapter",
+    "plugins",
+    "plugins.*",
+    "providers",
+    "providers.*",
+]
+
+[tool.setuptools.package-data]
+hermes_cli = ["observability/schemas/*.json"]
+# gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
+# screenshot. Without this, sealed venvs (uv2nix) silently lose both —
+# status phrases fall back to the tiny hardcoded set and the Telegram
+# topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
+# in gateway/status_phrases.py and gateway/run.py.
+gateway = ["assets/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring external services (API keys, Modal, etc.)",
+    "real_concurrent_gate: opt out of the autouse stub that disables _detect_concurrent_hermes_instances",
+    "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
+    "requires_wal: needs the runtime to actually enable SQLite WAL mode (skipped where Hermes falls back to journal_mode=DELETE)",
+    "no_isolate: opt out of per-file subprocess isolation (tests share mutable module-level state)",
+    "ssh: marks tests requiring a reachable SSH server (skipped in normal CI)",
+]
+# integration tests take way too long to run in the normal CI environments
+addopts = "-m 'not integration'"
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.rules]
+unknown-argument = "warn"
+redundant-cast = "ignore"
+
+[tool.ruff]
+preview = true # required for PLW1514 (unspecified-encoding) — preview rule
+
+[tool.ruff.lint]
+# All other lints are intentionally disabled (see comment history on this
+# file) while we wrangle typechecks — but PLW1514 is too load-bearing to
+# keep off.  Bare open()/read_text()/write_text() in text mode defaults to
+# the system locale encoding on Windows (cp1252 on US-locale installs),
+# which silently corrupts any non-ASCII file content.  We had three
+# separate Windows sandbox regressions in one debug session before
+# adding the explicit encoding.  This rule keeps new code honest.
+select = ["PLW1514"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests can intentionally exercise locale-encoding edge cases.
+"tests/**" = ["PLW1514"]
+# Skills and plugins are partially user-authored — their own conventions.
+"skills/**" = ["PLW1514"]
+"optional-skills/**" = ["PLW1514"]
+"plugins/**" = ["PLW1514"]
