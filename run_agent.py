@@ -393,8 +393,18 @@ def main(
 
     # TODO 可用工具分类
 
-    # 凭据兜底：命令行没传时从环境变量读取（OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL）
-    api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    # 加载项目根 .env（python run_agent.py 入口同样支持 .env 凭据）
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+    # 凭据兜底：命令行没传时从环境变量/.env 读取（OPENAI_API_KEY / DEEPSEEK_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL）
+    api_key = (
+        api_key
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("DEEPSEEK_API_KEY")
+        or os.getenv("OPENROUTER_API_KEY")
+    )
     base_url = base_url or os.getenv("OPENAI_BASE_URL") or ""
     model = model or os.getenv("OPENAI_MODEL") or ""
 
