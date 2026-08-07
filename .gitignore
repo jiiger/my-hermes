@@ -199,3 +199,9 @@ native/fts5_cjk/*.so
 .lazy-refresh-incomplete
 
 my_hermes.egg-info
+
+.ruff_cache
+
+
+# Test files are local-only (user decision)
+tests/
