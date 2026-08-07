@@ -1,9 +1,10 @@
 import logging
+import os
 import uuid
 from typing import Any, Dict, List, Optional
 
 from agent import relay_runtime
-from agent.process_bootstrap import _get_proxy_for_base_url
+from agent.process_bootstrap import OpenAI, _get_proxy_for_base_url
 from utils import base_url_hostname
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,28 @@ class AIAgent:
         model = getattr(self, "model", "unknown")
         return f"provider={provider} base_url={base_url} model={model}"
 
+    def _safe_print(self, *args, **kwargs) -> None:
+        """线程安全的 print 包装（对应原版 run_agent.py 的 _safe_print）。
+
+        精简版直接用 print + flush；以后接入流式/多线程时在此加锁即可。
+        """
+        kwargs.setdefault("flush", True)
+        print(*args, **kwargs)
+
+    def _needs_thinking_reasoning_pad(self) -> bool:
+        """判断当前 provider 是否需要 reasoning_content 回填。
+
+        DeepSeek / Kimi(Moonshot) / 小米 MiMo 的 thinking 模式会拒绝缺少
+        reasoning_content 的 assistant 工具调用消息回放（原版 run_agent.py:7159）。
+        精简版只做 provider 名 + host 的简单匹配。
+        """
+        provider = (getattr(self, "provider", "") or "").lower()
+        host = (getattr(self, "_base_url_lower", "") or "").lower()
+        return any(
+            kw in provider or kw in host
+            for kw in ("deepseek", "kimi", "moonshot", "mimo")
+        )
+
     def request_interrupt(self) -> None:
         """请求中断当前轮次：置位 _interrupt_requested。
 
@@ -137,14 +160,12 @@ class AIAgent:
                     result = impl(**args)
                 except Exception as exc:
                     result = f"工具执行异常: {type(exc).__name__}: {exc}"
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": name,
-                    "content": str(result),
-                }
-            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "name": name,
+                "content": str(result),
+            })
 
     def run_conversation(
         self,
@@ -332,6 +353,36 @@ class AIAgent:
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
 
+    def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
+        """Forwarder — see ``agent.agent_runtime_helpers.copy_reasoning_content_for_api``."""
+        from agent.agent_runtime_helpers import copy_reasoning_content_for_api
+
+        return copy_reasoning_content_for_api(self, source_msg, api_msg)
+
+    def _reset_activity_labels_after_turn(self) -> None:
+        """清理本轮遗留的活动标签（如"压缩中/执行工具中"等展示状态）。
+
+        保留 ``_last_activity_ts`` 让空闲/看门狗时钟保持连续；清空描述与
+        来源，避免缓存的 agent 在轮次结束后仍展示上一轮的中间状态。
+        清理失败也直接忽略，不能影响收尾（对应原版 run_agent.py 的实例方法）。
+        """
+        from agent.session_activity import ActivityProvenance
+
+        self._last_activity_desc = ""
+        self._last_activity_provenance = ActivityProvenance.UNKNOWN
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        if not session_id or session_db is None:
+            return
+        clear = getattr(session_db, "clear_session_activity_labels", None)
+        if not callable(clear):
+            return
+        try:
+            clear(session_id)
+        except Exception:
+            # Never let durable cleanup I/O break turn teardown.
+            pass
+
 
 def main(
     query: str = None,
@@ -341,6 +392,11 @@ def main(
 ):
 
     # TODO 可用工具分类
+
+    # 凭据兜底：命令行没传时从环境变量读取（OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL）
+    api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    base_url = base_url or os.getenv("OPENAI_BASE_URL") or ""
+    model = model or os.getenv("OPENAI_MODEL") or ""
 
     # 创建agent
     try:
@@ -362,13 +418,12 @@ def main(
     print(f"\n User Query : {user_query}")
     print("\n" + "=" * 50)
 
-    # TODO 定义run_conversation（）
-    resule = agent.run_conversation(user_query)
+    result = agent.run_conversation(user_query)
 
-    if resule["final_response"]:
+    if result["final_response"]:
         print("\n🎯 FINAL RESPONSE:")
         print("-" * 30)
-        print(resule["final_response"])
+        print(result["final_response"])
 
     # TODO 保存样本轨迹
 
@@ -393,28 +448,33 @@ def main(
     # TODO 保存样本轨迹
 
 
-def _reset_activity_labels_after_turn(self) -> None:
-    """Drop mid-turn activity labels once the turn is no longer running.
+if __name__ == "__main__":
+    # CLI 入口：python run_agent.py "你的问题" [--model ...] [--api-key ...] [--base-url ...]
+    import argparse
 
-    Keeps ``_last_activity_ts`` so idle/watchdog clocks stay continuous
-    across interrupt-recursive turns (#15654) and between turns. Clears
-    description + provenance so idle cached agents / SessionDB listings
-    do not keep advertising the last mid-turn stamp (e.g. compression
-    or tool execution) after the turn ended (#72039).
-    """
-    from agent.session_activity import ActivityProvenance
-
-    self._last_activity_desc = ""
-    self._last_activity_provenance = ActivityProvenance.UNKNOWN
-    session_id = getattr(self, "session_id", None)
-    session_db = getattr(self, "_session_db", None)
-    if not session_id or session_db is None:
-        return
-    clear = getattr(session_db, "clear_session_activity_labels", None)
-    if not callable(clear):
-        return
-    try:
-        clear(session_id)
-    except Exception:
-        # Never let durable cleanup I/O break turn teardown.
-        pass
+    _parser = argparse.ArgumentParser(description="my-hermes agent 命令行入口")
+    _parser.add_argument(
+        "query", nargs="?", default=None, help="用户问题（不传则用内置示例问题）"
+    )
+    _parser.add_argument(
+        "--model", default="", help="模型名（默认读环境变量 OPENAI_MODEL）"
+    )
+    _parser.add_argument(
+        "--api-key",
+        dest="api_key",
+        default=None,
+        help="API key（默认读 OPENAI_API_KEY）",
+    )
+    _parser.add_argument(
+        "--base-url",
+        dest="base_url",
+        default=None,
+        help="API base URL（默认读 OPENAI_BASE_URL）",
+    )
+    _args = _parser.parse_args()
+    main(
+        query=_args.query,
+        model=_args.model,
+        api_key=_args.api_key,
+        base_url=_args.base_url,
+    )

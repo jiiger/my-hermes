@@ -55,9 +55,13 @@ def create_openai_client(agent,client_kwargs:dict,*,reason:str,shared:bool)->Any
     )
     return client
 
+
     
     
-    
-    
-    
-    
+def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:
+
+    from agent.message_sanitization import apply_reasoning_content_policy
+
+    apply_reasoning_content_policy(
+        source_msg, api_msg, agent._needs_thinking_reasoning_pad()
+    )

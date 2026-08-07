@@ -99,6 +99,11 @@ def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,
     agent.valid_tool_names = set()  # 合法工具名集合（校验用）
     agent._tool_impls = {}  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
 
+    # ── 主循环用到的其他默认状态（原版在 agent_init 各处初始化）──
+    agent.ephemeral_system_prompt = None  # 临时系统提示词（叠加在系统提示之后）
+    agent.prefill_messages = []  # 预填充消息（插在系统提示之后、历史之前）
+    agent._api_max_retries = 3  # API 调用失败的最大重试次数
+
     # TODO 。。。。。。
         
     

@@ -3,9 +3,11 @@
 结构与原版 agent/conversation_loop.py 对应：
 - 序言：每回合一次性设置（build_turn_context 完成，本文件负责
   组装调用参数、定义回调函数、解包结果、初始化循环状态）；
-- 主循环：TODO 下一步实现（API 调用 + 工具执行）。
+- 主循环：中断/预算检查 → api_messages 组装 → API 调用（带重试）→
+  工具执行 / 拿到最终回答退出。
 """
 
+import time
 from typing import Any, Dict, List, Optional
 
 from agent.process_bootstrap import _install_safe_stdio
@@ -45,9 +47,7 @@ def _sanitize_surrogates(text: Any) -> Any:
     """
     if not isinstance(text, str):
         return text
-    return "".join(
-        ch if not (0xD800 <= ord(ch) <= 0xDFFF) else "\ufffd" for ch in text
-    )
+    return "".join(ch if not (0xD800 <= ord(ch) <= 0xDFFF) else "\ufffd" for ch in text)
 
 
 def _summarize_user_message_for_log(message: Any, limit: int = 60) -> str:
@@ -141,32 +141,229 @@ def run_conversation(
     final_response = None  # 最终回复文本
     interrupted = False  # 是否被用户/上层中断
     failed = False  # 本轮是否失败
-    length_continue_retries = 0  # finish_reason=length 时的续写重试计数
+    length_continue_retries = (
+        0  # finish_reason=length 时的续写重试计数（精简版不实现续写，先占位）
+    )
+    _turn_exit_reason = "completed"  # 轮次退出原因（中断/预算/API失败/正常完成）
 
     # ══════════════════════════════════════════════════════════════
-    # 主循环（下一步实现）
-    #
-    # 原版骨架（对应原版 1415 行起）：
-    #   while (api_call_count < agent.max_iterations
-    #          and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
-    #       if agent._interrupt_requested:
-    #           interrupted = True
-    #           break
-    #       api_call_count += 1
-    #       api_messages = [系统提示] + messages      # 组装请求消息
-    #       tools_for_api = agent.tools              # 工具 schema
-    #       response = agent.client.chat.completions.create(
-    #           model=agent.model, messages=api_messages, tools=tools_for_api)
-    #       if response.tool_calls:
-    #           messages.append(assistant 消息)
-    #           agent._execute_tool_calls(response, messages,
-    #                                     effective_task_id, api_call_count)
-    #       else:
-    #           final_response = response.content
-    #           break
-    #   最后返回 {"final_response": final_response, "messages": messages,
-    #             "interrupted": interrupted, "failed": failed, ...}
+    # 主循环：每轮 = "调 API → 有工具调用就执行工具继续下一轮，
+    #               否则拿到最终回答退出"。最多跑 max_iterations 轮，
+    #               受迭代预算（iteration_budget.remaining）约束。
     # ══════════════════════════════════════════════════════════════
-    raise NotImplementedError(
-        "主循环尚未实现：下一步补 while 循环（API 调用 + 工具执行），骨架见上方注释"
-    )
+    while (
+        api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0
+    ) or agent._budget_grace_call:
+        # ① 中断检查：协作式中断——用户请求中断后，本轮到这就退出。
+        #    正在执行的工具调用不会被强杀，等它自然结束
+        if agent._interrupt_requested:
+            interrupted = True
+            _turn_exit_reason = "interrupted_by_user"
+            if not agent.quiet_mode:
+                agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+            break
+
+        # ② 计数 + 预算消耗：正常轮次消耗一次迭代预算；
+        #    _budget_grace_call（宽限调用）不占预算，用一次就清掉
+        api_call_count += 1
+        agent._api_call_count = api_call_count
+        if agent._budget_grace_call:
+            agent._budget_grace_call = False
+        elif not agent.iteration_budget.consume():
+            _turn_exit_reason = "budget_exhausted"
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⚠️  Iteration budget exhausted "
+                    f"({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)"
+                )
+            break
+
+        # ③ 组装发给 API 的消息：messages 是工作副本（带内部字段），
+        #    发给 API 前要剥掉内部字段（display_kind/api_context/_row_id 等）
+        api_messages = []
+        for idx, msg in enumerate(messages):
+            api_msg = msg.copy()
+
+            # api_context：某些场景下消息的"API 专用内容"（如语音前缀），
+            # 与转录展示的 content 不同。先取出，再按规则决定是否覆盖
+            _api_content = api_msg.pop("api_context", None)
+            api_msg.pop("display_kind", None)
+            api_msg.pop("display_metadata", None)
+            api_msg.pop("_row_id", None)
+
+            if idx == current_turn_user_idx and msg.get("role") == "user":
+                # 当前用户消息：若存在 api_context 且是有效字符串，覆盖 content
+                if isinstance(_api_content, str) and _api_content:
+                    api_msg["content"] = _api_content
+            elif (
+                isinstance(_api_content, str)
+                and _api_content
+                and msg.get("role") in ("user", "assistant")
+            ):
+                api_msg["content"] = _api_content
+
+            # 推理内容回填：把轨迹里的 reasoning 复制成 API 的
+            # reasoning_content（DeepSeek/Kimi 等 thinking 模式需要）
+            agent._copy_reasoning_content_for_api(msg, api_msg)
+
+            # 以下字段只用于轨迹存储/展示，部分严格 API 会拒绝：
+            api_msg.pop("reasoning", None)  # 已复制到 reasoning_content，删掉原字段
+            api_msg.pop("finish_reason", None)  # 不接受 finish_reason（如 Mistral）
+            api_msg.pop("_thinking_prefill", None)  # 内部思考预填充标记
+
+            api_messages.append(api_msg)
+
+        # ④ 系统提示：拼到最前面。临时提示词（ephemeral）追加在系统提示之后
+        effective_system = active_system_prompt or ""
+        if getattr(agent, "ephemeral_system_prompt", None):
+            effective_system = (
+                effective_system + "\n\n" + str(agent.ephemeral_system_prompt).strip()
+            )
+        if effective_system:
+            # 注意：是 [system] + api_messages 拼接，不是覆盖！
+            # （原版 1713 行；这里修复了历史消息被丢弃的问题）
+            api_messages = [
+                {"role": "system", "content": effective_system}
+            ] + api_messages
+
+        # ⑤ 预填充消息（prefill）：插在系统提示之后、对话历史之前，
+        #    仅本次 API 调用生效（如自动续写的引导语）
+        for idx, pfm in enumerate(getattr(agent, "prefill_messages", None) or []):
+            sys_offset = (
+                1 if (api_messages and api_messages[0].get("role") == "system") else 0
+            )
+            api_messages.insert(sys_offset + idx, pfm.copy())
+
+        # ⑥ 工具 schema：精简版直接使用 agent.tools（OpenAI 格式）；
+        #    为空则不带 tools 参数（纯对话模式）
+        tools_for_api = getattr(agent, "tools", None)
+
+        # ⑦ API 调用准备
+        api_start_time = time.time()
+        retry_count = 0
+        max_retries = getattr(agent, "_api_max_retries", 3)  # 失败重试上限
+        finish_reason = "stop"
+        response = None
+        api_request_id = f"{turn_id}:api:{api_call_count}"  # 每次调用一个请求ID
+        agent._current_api_request_id = api_request_id
+
+        # ⑧ 内层循环：真正的 API 调用 + 失败重试。
+        #    精简版直接走 OpenAI SDK 的 chat.completions.create（非流式），
+        #    原版的流式/回退/中间件等机制已裁剪
+        while retry_count < max_retries:
+            try:
+                api_kwargs: Dict[str, Any] = {
+                    "model": agent.model,
+                    "messages": api_messages,
+                }
+                if tools_for_api:
+                    api_kwargs["tools"] = tools_for_api
+                response = agent.client.chat.completions.create(**api_kwargs)
+                break  # 成功拿到响应，退出重试循环
+            except Exception as exc:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    # 重试耗尽：本轮标记失败，错误信息作为最终回复返回
+                    failed = True
+                    _turn_exit_reason = "api_failed"
+                    final_response = f"API 调用失败（已重试 {max_retries} 次）: {exc}"
+                    break
+                if not getattr(agent, "quiet_mode", False):
+                    agent._safe_print(
+                        f"⚠️ API 调用失败（第 {retry_count}/{max_retries} 次）: "
+                        f"{exc}，准备重试..."
+                    )
+
+        if failed:
+            break
+        if response is None:
+            # 防御：重试循环因故退出但没有响应（正常不会走到）
+            failed = True
+            _turn_exit_reason = "api_failed"
+            final_response = "API 调用失败：所有重试均未获得响应"
+            break
+
+        # ⑨ 归一化响应：OpenAI chat.completions 的标准结构
+        #    （choices[0].message + choices[0].finish_reason）
+        assistant_message = response.choices[0].message
+        finish_reason = response.choices[0].finish_reason
+
+        # 内容归一化：部分 OpenAI 兼容服务器（llama-server 等）把 content
+        #    返回为 dict/list，统一转成字符串，避免下游 .strip() 崩溃
+        if assistant_message.content is not None and not isinstance(
+            assistant_message.content, str
+        ):
+            raw = assistant_message.content
+            if isinstance(raw, dict):
+                assistant_message.content = (
+                    raw.get("text", "") or raw.get("content", "") or str(raw)
+                )
+            elif isinstance(raw, list):
+                parts = []
+                for part in raw:
+                    if isinstance(part, str):
+                        parts.append(part)
+                    elif isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(part.get("text", ""))
+                assistant_message.content = "\n".join(parts)
+            else:
+                assistant_message.content = str(raw)
+
+        # ⑩ 分支：有工具调用 → 执行工具后继续下一轮；
+        #     没有 → 模型给出了最终回答，收尾退出
+        if assistant_message.tool_calls:
+            if not getattr(agent, "quiet_mode", False):
+                agent._safe_print(
+                    f"🔧 Processing {len(assistant_message.tool_calls)} tool call(s)..."
+                )
+
+            # 把 assistant 消息（含 tool_calls）归档进 messages：
+            # 工具结果会以 role="tool" 追加在它后面，下一轮模型才能看到
+            tool_calls_payload = []
+            for tc in assistant_message.tool_calls:
+                tool_calls_payload.append({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                })
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message.content or "",
+                "tool_calls": tool_calls_payload,
+            })
+
+            # 顺序执行工具调用：结果以 role="tool" 消息追加进 messages
+            # （对应原版 6365 行）
+            agent._execute_tool_calls(
+                assistant_message, messages, effective_task_id, api_call_count
+            )
+        else:
+            # 最终回答：把 assistant 消息归档进 messages（保持会话历史
+            #    完整，下一轮对话能接上），取出 content 作为最终回复
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message.content or "",
+            })
+            final_response = assistant_message.content
+            _turn_exit_reason = "completed"
+            break
+
+    # 循环自然退出（没拿到最终回答、也没中断/失败）→ 只能是预算或
+    # 迭代次数耗尽，归一化为 budget_exhausted（对应原版 finalize_turn）
+    if final_response is None and not interrupted and not failed:
+        _turn_exit_reason = "budget_exhausted"
+
+    # ══════════════════════════════════════════════════════════════
+    # 收尾：组装结果 dict（对应原版 finalize_turn 的简化替代）
+    # ══════════════════════════════════════════════════════════════
+    return {
+        "final_response": final_response,
+        "messages": messages,
+        "interrupted": interrupted,
+        "failed": failed,
+        "api_call_count": api_call_count,
+        "turn_exit_reason": _turn_exit_reason,
+    }
