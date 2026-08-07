@@ -1,14 +1,17 @@
 import logging
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+from agent.iteration_budget import IterationBudget
+
 logger = logging.getLogger("run_agent")
 
-def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,provider:str = None,model:str = None,quiet_mode:bool = False):
+def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,provider:str = None,model:str = None,quiet_mode:bool = False,max_iterations:int = 90):
     """
     初始化 agent
         
         api_model:指定 API 协议（如标准的 chat_completions 或 OpenAI 最新的 codex_responses）
         quiet_mode:安静模式
+        max_iterations:一轮对话中最大的 API 调用次数（工具循环上限，默认 90）
     """
     #TODO _install_safe_stdio()
     from agent.process_bootstrap import _install_safe_stdio
@@ -85,8 +88,17 @@ def init_agent(agent,base_url:str = None,api_mode:str = None,api_key:str = None,
     except Exception as e:
         raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
-    #TODO 。。。。。。
-        
-        
+    # ── 主循环前置依赖：迭代预算 / 中断状态（原版 agent_init.py:586-589, 780, 892）──
+    agent.max_iterations = max_iterations  # 一轮对话允许的最大 API 调用次数
+    agent.iteration_budget = IterationBudget(max_iterations)  # 线程安全预算计数器（.remaining > 0 是循环条件之一）
+    agent._budget_grace_call = False  # 预算用尽后的“宽限一次”标记（原版用于最后的收尾调用）
+    agent._interrupt_requested = False  # 中断标志：request_interrupt() 置位，主循环检查到即退出
+
+    # ── 工具注册（精简版暂无工具实现，先留注册口）──
+    agent.tools = []  # OpenAI 格式的工具 schema 列表（循环里作为 tools= 传给 API）
+    agent.valid_tool_names = set()  # 合法工具名集合（校验用）
+    agent._tool_impls = {}  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
+
+    # TODO 。。。。。。
         
     
