@@ -216,7 +216,7 @@ class AIAgent:
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(
-                        relay_runtime, outcome=relay_outcome
+                        relay_turn, outcome=relay_outcome
                     )
             finally:
                 try:

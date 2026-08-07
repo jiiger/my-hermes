@@ -17,36 +17,55 @@ from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
+# ---- Relay 作用域（scope）与元数据常量 ----
+# SESSION_SCOPE     : 会话级作用域名，一个 Hermes 会话对应一个 Agent 级 scope
+# TURN_SCOPE        : 轮次级作用域名，一次交互对应一个 Function 级 scope
+# LOGICAL_LLM_SCOPE : 逻辑 LLM 调用作用域名（本精简版中暂未直接使用）
+# RUNTIME_SCHEMA_KEY / RUNTIME_SCHEMA_VERSION : 写入 scope metadata 的 schema 版本，
+#                                               供观测端识别数据格式
+# RUNTIME_INSTANCE_KEY : 写入 scope metadata 的运行时实例 ID，标识 scope 由哪个实例创建
 SESSION_SCOPE = "hermes.session"
 TURN_SCOPE = "hermes.turn"
 LOGICAL_LLM_SCOPE = "hermes.logical_llm_call"
 RUNTIME_SCHEMA_KEY = "hermes.relay.schema_version"
 RUNTIME_SCHEMA_VERSION = "hermes.relay.runtime.v1"
 RUNTIME_INSTANCE_KEY = "hermes.relay.runtime_instance"
-_PROFILE_KEY_CACHE: dict[str, str] = {}
+_PROFILE_KEY_CACHE: dict[
+    str, str
+] = {}  # 缓存 {未解析路径: 解析后路径}，避免反复调用 resolve()
 
 
 @dataclass
 class RelaySession:
-    """一个由Hermes会话拥有的独立Relay作用域堆栈"""
+    """一个由 Hermes 会话拥有的独立 Relay 作用域堆栈。
 
-    session_id: str
-    parent_session_id: str = ""
-    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
-    closing: bool = False
-    handle: Any = None
-    context: contextvars.Context | None = None
+    每个 Hermes 会话（由 session_id 唯一标识）对应一个 RelaySession，
+    它承载该会话在 nemo_relay 中的整套 scope 栈：
+    - lock   : 串行化对句柄/上下文的访问（会话可能被多个线程同时使用）；
+    - handle : 会话 scope 栈顶句柄，后续的 turn / 逻辑 LLM 调用都挂在它之下；
+    - context: 保存了 scope 栈的 contextvars 快照，用于在异步/线程环境下恢复。
+    """
+
+    session_id: str  # 会话唯一标识（与 Hermes 的 session_id 一致）
+    parent_session_id: str = ""  # 父会话 ID；空串表示顶层会话（非子代理）
+    lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )  # 会话级可重入锁，保护 handle/context 的并发访问
+    closing: bool = False  # 关闭标记：True 表示会话正在收尾，拒绝新的 scope 操作
+    handle: Any = None  # 会话 scope 栈顶句柄（由 nemo_relay 的 scope.push 返回）
+    context: contextvars.Context | None = None  # 保存 scope 栈的上下文快照
 
 
 @dataclass(frozen=True)
 class NoopRelayRuntime:
     """这是一个降级存根(Stub)类，当平台装不了 nemo_relay 轮子(比如没有预编译的 wheel、架构不支持、或者用户没装)时，my-hermes 不会炸，而是用这个"空壳"继续跑。"""
 
-    profile_key: str
-    reason: str
+    profile_key: str  # 所属配置环境（仅用于记录/诊断）
+    reason: str  # 降级原因（例如导入 nemo_relay 时的异常信息）
 
     @property
     def available(self) -> bool:
+        """是否可用——空壳永远返回 False，表示本平台不提供任何 Relay 能力。"""
         return False
 
     def apply_tool_request_intercepts(
@@ -56,39 +75,56 @@ class NoopRelayRuntime:
         tool_name: str,
         args: dict[str, Any],
     ) -> dict[str, Any]:
+        """空壳版工具请求拦截：不重写任何参数，原样返回（fail-open，宽松失败）。"""
         del session_id, tool_name
         return args
 
     @staticmethod
     def retain_managed_execution(consumer: str) -> None:
+        """空壳版“保持受管执行”：什么都不做（本就没有受管执行管线）。"""
         del consumer
 
     @staticmethod
     def release_managed_execution(consumer: str) -> None:
+        """空壳版“释放受管执行”：什么都不做。"""
         del consumer
 
     @staticmethod
     def managed_execution_enabled() -> bool:
+        """空壳版“受管执行是否启用”：永远返回 False。"""
         return False
 
     def shutdown(self) -> None:
-        """No resources are allocated on unsupported platforms."""
+        """空壳版关闭：不支持的平台上没有分配任何资源，因此无事可做。"""
 
 
 class RelayRuntime:
     """独立于任何导出器或插件，拥有自己的中继会话作用域"""
 
     def __init__(self, relay: Any = None, *, profile_key: str | None = None) -> None:
+        """初始化 Relay 运行时。
+
+        参数:
+            relay: nemo_relay 模块（默认懒加载）；显式传入主要用于测试注入。
+            profile_key: 所属配置环境标识；缺省时由 current_profile_key() 推导。
+
+        每个实例都会：
+        - 生成唯一 runtime_id，并随 scope 的 metadata 一起写入，
+          便于在观测端区分作用域属于哪个运行时实例；
+        - 在进程退出时通过 atexit 自动调用 shutdown() 收尾所有会话。
+        """
         self.relay = relay or _load_nemo_relay()
         self.profile_key = profile_key or current_profile_key()
         self.runtime_id = uuid.uuid4().hex
-        self._sessions_lock = threading.RLock()
-        self._sessions: dict[str, RelaySession] = {}
-        self._subagent_parents: dict[str, str] = {}
-        self._subagent_parent_handles: dict[str, Any] = {}
-        self._execution_consumers_lock = threading.RLock()
-        self._execution_consumers: set[str] = set()
-        self._shutdown_registered = True
+        self._sessions_lock = threading.RLock()  # 保护 _sessions 与子代理登记表的锁
+        self._sessions: dict[str, RelaySession] = {}  # {session_id: RelaySession}
+        self._subagent_parents: dict[str, str] = {}  # {子会话ID: 父会话ID}
+        self._subagent_parent_handles: dict[str, Any] = {}  # {子会话ID: 父会话句柄}
+        self._execution_consumers_lock = threading.RLock()  # 保护受管执行消费方集合的锁
+        self._execution_consumers: set[str] = (
+            set()
+        )  # 需要受管执行的消费方（本精简版暂未使用）
+        self._shutdown_registered = True  # 是否已在 atexit 中登记 shutdown
         atexit.register(self.shutdown)
 
     def register_subagent(
@@ -97,7 +133,12 @@ class RelayRuntime:
         *,
         metadata: dict[str, Any] | None = None,
     ) -> RelaySession | None:
-        """Open a child Agent scope under its spawning turn when available."""
+        """在父会话的轮次之下，为子代理开启一个子会话作用域。
+
+        参数 event 至少需要包含 parent_session_id 与 child_session_id；
+        若父会话当前有一个活跃且属于本运行时的轮次，则子会话的 scope
+        会挂在父轮次句柄之下，否则挂在父会话句柄之下。
+        """
         parent_session_id = str(event.get("parent_session_id") or "")
         child_session_id = str(event.get("child_session_id") or "")
         if (
@@ -134,7 +175,13 @@ class RelayRuntime:
         data: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> RelaySession | None:
-        """Return the existing session scope or create it once."""
+        """返回已存在的会话作用域；不存在则只创建一次。
+
+        幂等 + 并发安全：多线程同时调用也只会产生一个 RelaySession。
+        首次创建时会向 nemo_relay 推入一个 Agent 级 scope 作为会话根，
+        并把创建它的运行时实例 ID、schema 版本写入 scope metadata；
+        若会话有父会话，则额外标注 nemo_relay_scope_role=subagent。
+        """
         session_id = _session_id(event)
         if not session_id:
             return None
@@ -169,6 +216,8 @@ class RelayRuntime:
                     scope_metadata["nemo_relay_scope_role"] = "subagent"
                 context = contextvars.Context()
                 try:
+                    # 在全新的 contextvars 上下文中推入会话 scope，
+                    # 把 scope 栈与调用方上下文隔离，互不污染。
                     session.handle = context.run(
                         self.relay.scope.push,
                         SESSION_SCOPE,
@@ -184,14 +233,143 @@ class RelayRuntime:
                 session.context = context
         return session
 
+    def get_session(self, session_id: str) -> RelaySession | None:
+        """返回活跃的 Hermes Relay 会话；不创建新会话。
 
-RelayHost = RelayRuntime | NoopRelayRuntime
+        已关闭（closing）的会话视为不存在。
+        """
+        with self._sessions_lock:
+            session = self._sessions.get(str(session_id or ""))
+        if session is None:
+            return None
+        with session.lock:
+            return None if session.closing else session
+
+    def run_in_session(
+        self,
+        session: RelaySession,
+        callback: Callable[..., Any],
+        *args: Any,
+        allow_closing: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """在会话的隔离 scope 栈上执行一个 Relay 操作（如 scope.push/pop）。
+
+        原理：取出会话保存的 contextvars 快照副本，把其中的上下文变量
+        恢复进当前上下文再执行回调——既复用了会话的 scope 栈，
+        又不会让调用方的上下文变量泄漏进会话。
+        """
+        with session.lock:
+            if session.closing and not allow_closing:
+                raise RuntimeError("Hermes Relay session is closing")
+            if session.context is None or session.handle is None:
+                raise RuntimeError("Hermes Relay session context is unavailable")
+            relay_context = session.context.copy()
+
+        context = contextvars.copy_context()
+        for variable, value in relay_context.items():
+            context.run(variable.set, value)
+
+        def invoke() -> Any:
+            self.relay.get_scope_stack()
+            return callback(*args, **kwargs)
+
+        # 使用副本：允许被既有 Relay 回调调用的辅助函数重入同一逻辑会话，
+        # 而无需重入 Context。
+        return context.run(invoke)
+
+    def close_session(self, event: dict[str, Any]) -> None:
+        """关闭一个会话作用域，并从核心注册表中移除。
+
+        先 pop 掉会话 scope（允许在 closing 状态下收尾），再冲刷订阅者，
+        最后清理 _sessions 与子代理登记表；收尾过程中的错误只记警告，
+        不中断流程。
+        """
+        session_id = _session_id(event)
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+        if session is None:
+            with self._sessions_lock:
+                self._subagent_parents.pop(session_id, None)
+                self._subagent_parent_handles.pop(session_id, None)
+            return
+        failures: list[str] = []
+        with session.lock:
+            if session.closing:
+                return
+            session.closing = True
+            if session.handle is not None:
+                try:
+                    self.run_in_session(
+                        session,
+                        self.relay.scope.pop,
+                        session.handle,
+                        output={},
+                        metadata={
+                            RUNTIME_SCHEMA_KEY: RUNTIME_SCHEMA_VERSION,
+                            RUNTIME_INSTANCE_KEY: self.runtime_id,
+                        },
+                        allow_closing=True,
+                    )
+                except Exception as exc:
+                    failures.append(f"session scope close failed: {exc}")
+        try:
+            self.relay.subscribers.flush()
+        except Exception as exc:
+            failures.append(f"subscriber flush failed: {exc}")
+        with self._sessions_lock:
+            if self._sessions.get(session_id) is session:
+                self._sessions.pop(session_id, None)
+            self._subagent_parents.pop(session_id, None)
+            self._subagent_parent_handles.pop(session_id, None)
+        if failures:
+            logger.warning(
+                "Hermes Relay session %s closed with errors: %s",
+                session_id,
+                "; ".join(failures),
+            )
+
+    def unregister_subagent(self, event: dict[str, Any]) -> None:
+        """关闭一个被委派的子会话，并遗忘其父子关系登记。"""
+        child_session_id = str(event.get("child_session_id") or "")
+        if not child_session_id:
+            return
+        self.close_session({"session_id": child_session_id})
+        with self._sessions_lock:
+            self._subagent_parents.pop(child_session_id, None)
+            self._subagent_parent_handles.pop(child_session_id, None)
+
+    def shutdown(self) -> None:
+        """关闭本运行时拥有的所有 Relay 会话作用域（进程退出时由 atexit 调用）。"""
+        with self._sessions_lock:
+            session_ids = list(self._sessions)
+        for session_id in session_ids:
+            self._safe(self.close_session, {"session_id": session_id})
+        if self._shutdown_registered:
+            try:
+                atexit.unregister(self.shutdown)
+            except Exception:
+                pass
+            self._shutdown_registered = False
+
+    @staticmethod
+    def _safe(callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """执行回调并吞掉异常（fail-open），失败时返回 None。"""
+        try:
+            return callback(*args, **kwargs)
+        except Exception:
+            logger.warning("Hermes Relay runtime operation failed", exc_info=True)
+            return None
+
+
+RelayHost = RelayRuntime | NoopRelayRuntime  # 真实运行时与空壳运行时的联合类型
 
 
 class RelayHostRegistry:
     """RelayHostRegistry 是 "profile 维度的单例工厂"——确保同一个 Hermes 配置环境只有一个 Relay 运行时实例，创建失败自动降级为空壳，关闭时避免锁内阻塞。"""
 
     def __init__(self) -> None:
+        """构造一个空注册表：一把可重入锁 + 一个 {profile_key: host} 字典。"""
         self._lock = threading.RLock()
         self._hosts: dict[str, RelayHost] = {}
 
@@ -201,6 +379,12 @@ class RelayHostRegistry:
         *,
         create: bool = True,
     ) -> RelayHost | None:
+        """按 profile 获取（或创建）唯一的 Relay 主机实例。
+
+        采用“双检锁”（double-checked locking）保证同一 profile 只实例化一次；
+        创建 RelayRuntime 失败时自动降级为 NoopRelayRuntime 空壳并记录警告，
+        确保上层流程不受影响。create=False 时只查询、不创建。
+        """
         key = profile_key or current_profile_key()
         host = self._hosts.get(key)
         if host is not None or not create:
@@ -220,45 +404,63 @@ class RelayHostRegistry:
             return host
 
 
-HOST_REGISTRY = RelayHostRegistry()
+HOST_REGISTRY = RelayHostRegistry()  # 全局唯一的 Relay 主机注册表单例
 
 
 @dataclass
 class ConversationLease:
-    """一次对话的使用权凭证"""
+    """一次对话的使用权凭证（lease）。
 
-    profile_key: str
-    session_id: str
-    platform: str
-    host: RelayHost
-    session: RelaySession | None
-    parent_session_id: str = ""
-    released: bool = False
+    由 acquire_conversation() 签发，记录该对话归属于哪个 profile/会话/平台，
+    以及底层对应的 Relay 主机和会话对象；released 标记该租约是否已被释放。
+    """
+
+    profile_key: str  # 归属的 Hermes 配置环境
+    session_id: str  # 会话 ID
+    platform: str  # 执行平台（telegram / cli / discord 等）
+    host: RelayHost  # 实际（或空壳）Relay 主机
+    session: RelaySession | None  # 底层 Relay 会话；创建失败时为 None
+    parent_session_id: str = ""  # 父会话 ID（子代理场景）
+    released: bool = False  # 租约是否已释放（释放后不能再 begin_turn）
 
 
 @dataclass
 class RelayTurnContext:
-    """Runtime-only context for one Hermes turn or top-level task."""
+    """一个 Hermes 轮次（turn）或顶层任务专用的运行时上下文。
 
-    lease: ConversationLease
-    turn_id: str
-    task_id: str
-    handle: Any = None
-    logical_llm_calls: dict[str, Any] = field(default_factory=dict, repr=False)
-    logical_llm_lock: threading.RLock = field(
+    由 begin_turn() 创建并写入 contextvars（_CURRENT_TURN），
+    让当前轮次中的异步任务/线程都能通过 current_turn() 拿到它；
+    其中记录了轮次句柄、逻辑 LLM 调用簿，以及收尾所需的锁。
+    """
+
+    lease: ConversationLease  # 本轮次对应的对话租约
+    turn_id: str  # 轮次唯一 ID
+    task_id: str  # 所属任务 ID
+    handle: Any = None  # 轮次在 Relay 中的 scope 句柄（TURN_SCOPE）
+    logical_llm_calls: dict[str, Any] = field(
+        default_factory=dict, repr=False
+    )  # {request_id: 逻辑 LLM 调用句柄}，轮次结束时倒序回收
+    logical_llm_lock: threading.RLock = field(  # 保护 logical_llm_calls 的锁
         default_factory=threading.RLock,
         repr=False,
     )
-    finalize_lock: threading.RLock = field(
+    finalize_lock: threading.RLock = field(  # 收尾锁，保证 end_turn 幂等
         default_factory=threading.RLock,
         repr=False,
     )
-    _previous_turn: RelayTurnContext | None = field(default=None, repr=False)
-    _active_registered: bool = field(default=False, repr=False)
-    relay_enabled: bool = True
-    closed: bool = False
+    _previous_turn: RelayTurnContext | None = field(
+        default=None, repr=False
+    )  # 被本轮次覆盖的上一个轮次上下文（用于结束后的复位）
+    _active_registered: bool = field(
+        default=False, repr=False
+    )  # 是否已登记到活跃轮次表
+    relay_enabled: bool = (
+        True  # 是否启用 Relay 插桩（同一会话的并发轮次会被置为 False）
+    )
+    closed: bool = False  # 轮次是否已关闭
 
 
+# 全局“当前轮次”上下文变量：在不同异步任务/线程之间隔离，互不串扰
 _CURRENT_TURN: contextvars.ContextVar[RelayTurnContext | None] = contextvars.ContextVar(
     "hermes_relay_turn", default=None
 )
@@ -268,6 +470,18 @@ class RelaySessionCoordinator:
     """这是 Hermes 核心的"会话与轮次生命周期管家"。它负责把一次对话（session）和其中每一轮交互（turn）的创建、运行、收尾全部串起来，同时对接底层的 nemo_relay 观测系统（或它的空壳替身 NoopRelayRuntime）。"""
 
     def __init__(self, registry: RelayHostRegistry = HOST_REGISTRY) -> None:
+        """构造协调器。
+
+        参数:
+            registry: 使用的 Relay 主机注册表（默认全局单例 HOST_REGISTRY，
+                      测试时可替换为隔离的注册表）。
+
+        内部维护：
+        - _session_initializers: 按名字注册的“会话初始化器”回调表，
+          在创建会话 scope 之前统一执行准备工作；
+        - _active_turns: {(profile_key, session_id): {turn对象id集合}}，
+          用于检测同一会话内的并发轮次。
+        """
         self.registry = registry
         self._initializer_lock = threading.RLock()
         self._session_initializers: dict[
@@ -282,6 +496,11 @@ class RelaySessionCoordinator:
         host: RelayRuntime,
         context: dict[str, Any],
     ) -> None:
+        """执行所有已注册的“会话初始化器”（session initializer）。
+
+        在真正创建 Relay 会话作用域之前，先让各个组件（如导出器、插件）
+        有机会做准备工作；单个初始化器失败只记警告，不影响整体流程。
+        """
         with self._initializer_lock:
             initializers = list(self._session_initializers.items())
         for name, callback in initializers:
@@ -303,7 +522,14 @@ class RelaySessionCoordinator:
         parent_session_id: str = "",
         model: str = "",
     ) -> ConversationLease:
+        """为一个会话“租用”一次对话使用权，返回租约凭证。
 
+        流程：按 profile_key 找到（或创建）Relay 主机 → 先跑一遍会话初始化器 →
+        按是否有父会话决定注册为子代理（register_subagent）还是普通会话
+        （ensure_session）→ 返回 ConversationLease。
+        任何异常都会被吞掉并记警告（fail-open），保证上层对话流程不中断；
+        即使主机是空壳，也照常返回租约，只是 session 为 None。
+        """
         host = self.registry.for_profile(profile_key)
         if host is None:
             host = NoopRelayRuntime(profile_key, "Relay host creation was disabled")
@@ -327,7 +553,7 @@ class RelaySessionCoordinator:
                             "parent_session_id": parent_session_id,
                             "child_session_id": session_id,
                         },
-                        metadate=metadata,
+                        metadata=metadata,
                     )
                 else:
                     session = host.ensure_session(
@@ -350,7 +576,7 @@ class RelaySessionCoordinator:
 
     @staticmethod
     def release_conversation(lease: ConversationLease) -> None:
-        """Release a caller lease without closing a resumable conversation."""
+        """释放调用方持有的租约，但保留可恢复的会话本身（不关闭）。"""
         lease.released = True
 
     def begin_turn(
@@ -360,6 +586,14 @@ class RelaySessionCoordinator:
         turn_id: str,
         task_id: str,
     ) -> RelayTurnContext:
+        """开启一轮新的 Relay 轮次（turn），返回轮次上下文。
+
+        并发保护：同一会话内并发开启多轮时，由于 Relay 的 scope 栈是物理单栈
+        且不保证后进先出回收，后开的那一轮会被降级为“不插桩”
+        （relay_enabled=False），仅记一条警告。
+        轮次开启成功后，会把自身写入 contextvars（_CURRENT_TURN），
+        使异步/线程任务能通过 current_turn() 继承当前轮次上下文。
+        """
         if lease.released:
             raise RuntimeError("Hermes Relay conversation lease is released")
         turn = RelayTurnContext(lease=lease, turn_id=turn_id, task_id=task_id)
@@ -367,9 +601,9 @@ class RelaySessionCoordinator:
         with self._active_turns_lock:
             active = self._active_turns.get(key)
             if active:
-                # A Relay session owns one physical scope stack. Concurrent
-                # Hermes turns would create sibling scopes on that stack, but
-                # their completion order is not guaranteed to be LIFO.
+                # 一个 Relay 会话只拥有一套物理 scope 栈。并发开启多个 Hermes
+                # 轮次会在同一套栈上产生兄弟 scope，但它们的回收顺序不保证是
+                # 后进先出（LIFO），因此对并发轮次跳过 Relay 插桩。
                 turn.relay_enabled = False
                 logger.warning(
                     "Skipping Relay instrumentation for concurrent Hermes turn "
@@ -386,6 +620,8 @@ class RelaySessionCoordinator:
             and lease.session is not None
         ):
             try:
+                # 在会话上下文内推入一个 Function 级轮次 scope，
+                # 挂在会话句柄之下，元数据带上 schema 版本与运行时实例 ID。
                 turn.handle = lease.host.run_in_session(
                     lease.session,
                     lease.host.relay.scope.push,
@@ -411,6 +647,14 @@ class RelaySessionCoordinator:
         *,
         outcome: str,
     ) -> None:
+        """结束一轮 Relay 轮次，回收 scope 并复位上下文。
+
+        幂等设计：已关闭的轮次直接返回。收尾顺序：
+        1. 关闭逻辑 LLM 子作用域（倒序 pop）；
+        2. pop 掉轮次自己的 scope；
+        3. 若是子代理（有父会话），注销其子会话；
+        4. 从活跃轮次登记表移除，并把 contextvars 中的当前轮次恢复为上一个。
+        """
         with turn.finalize_lock:
             if turn.closed:
                 self._reset_turn_context(turn)
@@ -438,9 +682,8 @@ class RelaySessionCoordinator:
                             )
             finally:
                 try:
-                    # Delegated agents own one turn. Close their conversation
-                    # while the active-turn guard is still held so a parent
-                    # timeout fallback cannot race this terminal boundary.
+                    # 子代理只拥有一个轮次：在活跃轮次守卫仍然生效时关闭其
+                    # 会话，避免父级超时回退与本终态边界发生竞态。
                     if lease.parent_session_id and isinstance(lease.host, RelayRuntime):
                         lease.host.unregister_subagent({
                             "child_session_id": lease.session_id
@@ -454,13 +697,49 @@ class RelaySessionCoordinator:
                     self._unregister_active_turn(turn)
                     self._reset_turn_context(turn)
 
+    def _unregister_active_turn(self, turn: RelayTurnContext) -> None:
+        """把轮次从活跃轮次登记表（_active_turns）中移除。
+
+        仅当该轮次确实登记过才处理；集合清空后连键一起删除，
+        以便后续轮次能重新启用 Relay 插桩。
+        """
+        if not turn._active_registered:
+            return
+        key = (turn.lease.profile_key, turn.lease.session_id)
+        with self._active_turns_lock:
+            active = self._active_turns.get(key)
+            if active is not None:
+                active.discard(id(turn))
+                if not active:
+                    self._active_turns.pop(key, None)
+            turn._active_registered = False
+
+    @staticmethod
+    def _reset_turn_context(turn: RelayTurnContext) -> None:
+        """把 contextvars 中的当前轮次复位为被覆盖前的轮次。
+
+        只复位“当前正是本 turn”的情形，避免干扰更晚开启的轮次；
+        若上一轮次已关闭，则继续向上回溯，直到找到未关闭的轮次为止。
+        """
+        if _CURRENT_TURN.get() is not turn:
+            return
+        previous = turn._previous_turn
+        seen = {id(turn)}
+        while previous is not None and previous.closed:
+            if id(previous) in seen:
+                previous = None
+                break
+            seen.add(id(previous))
+            previous = previous._previous_turn
+        _CURRENT_TURN.set(previous)
+
     def finish_logical_calls(
         self,
         turn: RelayTurnContext,
         *,
         outcome: str,
     ) -> None:
-        """Close logical LLM children before sibling task aggregation scopes."""
+        """在兄弟任务聚合作用域关闭之前，先关闭逻辑 LLM 子作用域。"""
         with turn.finalize_lock:
             if turn.closed:
                 return
@@ -472,6 +751,12 @@ class RelaySessionCoordinator:
         *,
         outcome: str,
     ) -> None:
+        """按倒序逐个 pop 逻辑 LLM 调用作用域。
+
+        Relay 的 scope 是栈式管理：必须“后来先出”。如果最外层（最新）的
+        handle 关闭失败，那么更老的一批也不能安全关闭，因此把未关闭的
+        前缀重新放回 logical_llm_calls 保留，供诊断使用。
+        """
         lease = turn.lease
         if not isinstance(lease.host, RelayRuntime) or lease.session is None:
             return
@@ -493,9 +778,8 @@ class RelaySessionCoordinator:
                 )
             except Exception:
                 with turn.logical_llm_lock:
-                    # Relay scopes are stack-owned. If the newest remaining
-                    # handle cannot close, older handles cannot close safely
-                    # either, so retain the unclosed prefix for diagnostics.
+                    # Relay 的 scope 由栈管理：如果最新（最外层）的句柄关不掉，
+                    # 更老的一批也不能安全关闭，所以保留未关闭的前缀供诊断。
                     for pending_request_id, pending_handle in logical_calls[
                         : index + 1
                     ]:
@@ -510,11 +794,11 @@ class RelaySessionCoordinator:
                 break
 
 
-SESSION_COORDINATOR = RelaySessionCoordinator()
+SESSION_COORDINATOR = RelaySessionCoordinator()  # 全局唯一的会话协调器单例
 
 
 def current_turn() -> RelayTurnContext | None:
-    """Return the turn context inherited by current async and thread work."""
+    """返回当前异步任务/线程所继承的轮次上下文（不在轮次内时为 None）。"""
     return _CURRENT_TURN.get()
 
 
@@ -539,7 +823,11 @@ def current_profile_key() -> str:
 
 
 def active_turn(session_id: str | None = None) -> RelayTurnContext | None:
-    """Return a live turn only when it belongs to the active profile/session."""
+    """仅当轮次属于当前活跃的 profile/会话时才返回该轮次，否则返回 None。
+
+    校验项：轮次未关闭、租约未释放、profile 一致、会话 ID 匹配，
+    且底层会话仍在该主机上登记为活跃（防悬挂引用）。
+    """
     turn = current_turn()
     if turn is None or not turn.relay_enabled or turn.closed or turn.lease.released:
         return None
@@ -556,4 +844,5 @@ def active_turn(session_id: str | None = None) -> RelayTurnContext | None:
 
 
 def _session_id(event: dict[str, Any]) -> str:
+    """从事件字典中安全地取出 session_id；缺失时返回空字符串。"""
     return str(event.get("session_id") or "")
