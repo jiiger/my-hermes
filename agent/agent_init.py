@@ -271,6 +271,8 @@ def init_agent(
 
     # ══════════════════════════════════════════════════════════════
     # ⑩ 回退（fallback）：fallback_model 是 init 参数（原版 agent_init.py:1410-1421）
+    #    功能待实现——这里只保留"参数 → 状态"归一化与运行期属性占位，
+    #    切换逻辑（try_activate_fallback / restore_primary_runtime）以后补
     # ══════════════════════════════════════════════════════════════
     if isinstance(fallback_model, list):
         # 链式回退：list of {provider, model, base_url, api_key}

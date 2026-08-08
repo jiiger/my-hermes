@@ -1,8 +1,8 @@
 """聊天补全辅助：可中断的 API 调用（对应原版 agent/chat_completion_helpers.py）。
 
-当前只实现第二步的 interruptible_api_call（非流式 + 中断 + stale 超时）；
-流式（interruptible_streaming_api_call）、回退（try_activate_fallback）等
-后续步骤按计划补进本文件。
+当前实现：interruptible_api_call（非流式 + 中断 + stale 超时）与
+interruptible_streaming_api_call（流式 + delta 回调 + 工具调用聚合）；
+回退（try_activate_fallback）已暂删，功能待实现。
 """
 
 import threading
@@ -337,105 +337,3 @@ def interruptible_streaming_api_call(
     if result["error"] is not None:
         raise result["error"]
     return result["response"]
-
-
-# ── 回退（第四步）──────────────────────────────────────────────────────────
-
-
-def _fallback_entry_key(fb: dict) -> tuple:
-    """回退项的唯一键（provider, model, base_url），用于跳过不可用项。"""
-    return (
-        (fb.get("provider") or "").strip().lower(),
-        (fb.get("model") or "").strip(),
-        (fb.get("base_url") or "").strip(),
-    )
-
-
-def try_activate_fallback(agent, reason=None) -> bool:
-    """切到回退链的下一个 provider（对应原版 chat_completion_helpers.py:1730）。
-
-    重试耗尽后调用：前进 _fallback_index，把 provider/model/base_url/api_key
-    换成回退项的值——worker 工厂 _make_worker_client 每次按这些属性新建
-    客户端，所以切换对后续请求立即生效，无需动共享 client。
-
-    - 首次回退时记录主运行时快照（_primary_runtime），供 restore_primary_runtime 恢复；
-    - 限流类原因（rate_limit/upstream_rate_limit）启动 60s 冷却：冷却期内
-      恢复主 provider 会被跳过，防止刚切走又切回去立刻再被 429；
-    - 链耗尽或所有回退项无效 → 返回 False。
-
-    Args:
-        agent: AIAgent 实例。
-        reason: FailoverReason（可选，用于限流冷却）。
-
-    Returns:
-        True=已切到下一个回退 provider；False=链耗尽/无可用回退。
-    """
-    chain = getattr(agent, "_fallback_chain", None) or []
-    index = getattr(agent, "_fallback_index", 0)
-    if index >= len(chain):
-        return False
-
-    # 限流冷却：第一次 429 起 60s 内不恢复主 provider
-    if reason is not None and reason.value in ("rate_limit", "upstream_rate_limit"):
-        agent._rate_limited_until = time.monotonic() + 60.0
-
-    # 首次回退：记录主 provider 快照（restore_primary_runtime 据此恢复）
-    if not getattr(agent, "_fallback_activated", False):
-        agent._primary_runtime = {
-            "provider": getattr(agent, "provider", "") or "",
-            "model": getattr(agent, "model", "") or "",
-            "base_url": getattr(agent, "base_url", "") or "",
-            "api_key": getattr(agent, "api_key", "") or "",
-        }
-        agent._fallback_activated = True
-
-    unavailable = getattr(agent, "_unavailable_fallback_keys", None) or set()
-    while index < len(chain):
-        fb = chain[index]
-        agent._fallback_index = index + 1
-        # 跳过无效项（缺 model）与已标记不可用的项
-        if not (fb.get("model") or "").strip():
-            index = agent._fallback_index
-            continue
-        if _fallback_entry_key(fb) in unavailable:
-            index = agent._fallback_index
-            continue
-
-        # 应用回退配置：worker 工厂读这些属性建 client
-        agent.model = fb["model"].strip()
-        if fb.get("provider"):
-            agent.provider = fb["provider"].strip().lower()
-        if fb.get("base_url"):
-            agent.base_url = fb["base_url"].strip()
-        if fb.get("api_key"):
-            agent.api_key = fb["api_key"].strip()
-        return True
-    return False
-
-
-def restore_primary_runtime(agent) -> bool:
-    """恢复主 provider 运行时（每轮开始调用，对应原版 :6451）。
-
-    上一轮若发生过回退（_fallback_activated=True），把 provider/model/
-    base_url/api_key 恢复为 _primary_runtime 快照，重置回退游标，下一轮
-    从主 provider 重新开始。
-
-    限流冷却期内（_rate_limited_until 未到）跳过恢复——保持当前回退
-    provider，避免刚切走又切回主 provider 立刻再 429。
-    """
-    if not getattr(agent, "_fallback_activated", False):
-        return True
-    if time.monotonic() < getattr(agent, "_rate_limited_until", 0.0):
-        return False
-    primary = getattr(agent, "_primary_runtime", None) or {}
-    if primary.get("provider") is not None:
-        agent.provider = primary["provider"]
-    if primary.get("model"):
-        agent.model = primary["model"]
-    if primary.get("base_url"):
-        agent.base_url = primary["base_url"]
-    if primary.get("api_key"):
-        agent.api_key = primary["api_key"]
-    agent._fallback_index = 0
-    agent._fallback_activated = False
-    return True

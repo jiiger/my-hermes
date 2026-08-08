@@ -307,31 +307,6 @@ class AIAgent:
         """
         self._current_streamed_assistant_text = ""
 
-    def _try_activate_fallback(self, reason=None) -> bool:
-        """切到回退链的下一个 provider（重试耗尽后调用）。
-
-        Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``。
-        返回 False 表示链耗尽或无可用回退。
-        """
-        from agent.chat_completion_helpers import try_activate_fallback
-
-        return try_activate_fallback(self, reason)
-
-    def _restore_primary_runtime(self) -> bool:
-        """恢复主 provider 运行时（每轮开始调用）。
-
-        Forwarder — see ``agent.chat_completion_helpers.restore_primary_runtime``。
-        """
-        from agent.chat_completion_helpers import restore_primary_runtime
-
-        return restore_primary_runtime(self)
-
-    def _has_pending_fallback(self) -> bool:
-        """回退链是否还有可用项（对应原版 run_agent.py:6437）。"""
-        chain = getattr(self, "_fallback_chain", None) or []
-        index = getattr(self, "_fallback_index", 0)
-        return index < len(chain)
-
     def request_interrupt(self) -> None:
         """请求中断当前轮次：置位 _interrupt_requested。
 

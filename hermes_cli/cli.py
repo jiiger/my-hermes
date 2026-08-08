@@ -72,6 +72,11 @@ def _ask(text: str) -> str:
     return input(text)
 
 
+def _stream_print(text: str) -> None:
+    """流式回调：逐段打印（打字机效果，不换行）。"""
+    print(text, end="", flush=True)
+
+
 def interactive(agent: AIAgent) -> None:
     """交互模式：多轮对话，自动把上一轮 messages 传给下一轮。"""
     history = None  # 当前会话的完整消息列表（None = 新会话）
@@ -91,24 +96,30 @@ def interactive(agent: AIAgent) -> None:
             print("（已开启新会话）\n")
             continue
 
-        # 对话：把上一轮的 messages 作为 conversation_history 传入
-        result = agent.run_conversation(user_input, conversation_history=history)
+        # 对话：把上一轮的 messages 作为 conversation_history 传入；
+        # stream_callback 让最终回答逐段打印（打字机效果），
+        # 失败路径不走流式（重试耗尽，无响应可流）
+        print("🤖 ", end="", flush=True)
+        result = agent.run_conversation(
+            user_input,
+            conversation_history=history,
+            stream_callback=_stream_print,
+        )
+        print()  # 流式输出结束后换行
 
         if result["failed"]:
             print(f"❌ {result['final_response']}")
-        else:
-            print(f"🤖 {result['final_response']}")
 
         history = result["messages"]
 
 
 def once(agent: AIAgent, query: str) -> None:
     """单次查询模式：跑完一轮就退出。"""
-    result = agent.run_conversation(query)
+    result = agent.run_conversation(query, stream_callback=_stream_print)
+    print()  # 流式输出结束后换行
     if result["failed"]:
         print(f"❌ {result['final_response']}")
         sys.exit(1)
-    print(result["final_response"])
 
 
 def main() -> None:
