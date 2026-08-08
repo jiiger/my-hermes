@@ -66,8 +66,13 @@ def build_turn_context(
     5. 生成任务/轮次 ID。
     """
 
-    # 线程安全的 stdio 防护（后台任务/守护线程环境下避免 stdin/stdout 竞态）
+    # 线程安全的 stdio 防护（守护线程/后台任务环境下避免 stdin/stdout 竞态）
     install_safe_stdio()
+
+    # 挂载流式回调：调用方传入的 stream_callback 在本轮生效，
+    # 主循环的流式分支（interruptible_streaming_api_call）会逐增量触发它
+    if stream_callback is not None:
+        agent._stream_callback = stream_callback
 
     # 净化用户消息：去掉孤立代理对字符，防止下游编码错误
     user_message = sanitize_surrogates(user_message)

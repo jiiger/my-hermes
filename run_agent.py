@@ -30,6 +30,17 @@ class AIAgent:
         model: str = None,
         quiet_mode: bool = False,
         max_iterations: int = 90,
+        fallback_chain: list = None,
+        # ── 配置性状态（透传给 init_agent，见 agent/agent_init.py）──
+        ephemeral_system_prompt: str = None,
+        prefill_messages: list = None,
+        api_max_retries: int = 3,
+        api_stale_timeout: float = 180.0,
+        tools: list = None,
+        valid_tool_names: set = None,
+        tool_impls: dict = None,
+        stream_delta_callback: callable = None,
+        session_id: str = None,
     ):
 
         from agent.agent_init import init_agent
@@ -43,6 +54,16 @@ class AIAgent:
             model=model,
             quiet_mode=quiet_mode,
             max_iterations=max_iterations,
+            fallback_chain=fallback_chain,
+            ephemeral_system_prompt=ephemeral_system_prompt,
+            prefill_messages=prefill_messages,
+            api_max_retries=api_max_retries,
+            api_stale_timeout=api_stale_timeout,
+            tools=tools,
+            valid_tool_names=valid_tool_names,
+            tool_impls=tool_impls,
+            stream_delta_callback=stream_delta_callback,
+            session_id=session_id,
         )
 
     def _create_openai_client(
@@ -117,6 +138,88 @@ class AIAgent:
             kw in provider or kw in host
             for kw in ("deepseek", "kimi", "moonshot", "mimo")
         )
+
+    def _make_worker_client(self) -> Any:
+        """为后台工作线程创建独立的 OpenAI 客户端（worker-local）。
+
+        中断/stale 时主线程会 close() 请求客户端来打断阻塞中的 HTTP 调用；
+        如果 close 的是共享的 agent.client，本轮后续请求全部报废。
+        worker-local client 每次调用独立创建、用完即关，中断只影响本次请求。
+        """
+        from agent.agent_runtime_helpers import create_openai_client
+
+        client_kwargs = {
+            "api_key": getattr(self, "api_key", None) or "",
+            "base_url": getattr(self, "base_url", "") or "",
+        }
+        return create_openai_client(self, client_kwargs, reason="worker", shared=False)
+
+    def _interruptible_api_call(self, api_kwargs: dict, **kw) -> Any:
+        """可中断的非流式 API 调用。
+
+        Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``。
+        后台线程执行请求，主线程轮询中断标志；用户中断时立即抛
+        InterruptedError，不必等完整 HTTP 往返。
+        """
+        from agent.chat_completion_helpers import interruptible_api_call
+
+        return interruptible_api_call(self, api_kwargs, **kw)
+
+    def _interruptible_streaming_api_call(
+        self, api_kwargs: dict, *, on_first_delta: callable = None, **kw
+    ) -> Any:
+        """可中断的流式 API 调用（逐增量触发 stream_delta_callback / _stream_callback）。
+
+        Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``。
+        返回聚合后的响应对象（形状与非流式一致，主循环无需感知流式）。
+        """
+        from agent.chat_completion_helpers import interruptible_streaming_api_call
+
+        return interruptible_streaming_api_call(
+            self, api_kwargs, on_first_delta=on_first_delta, **kw
+        )
+
+    def _has_stream_consumers(self) -> bool:
+        """是否有流式消费者（注册了 stream_delta_callback / _stream_callback）。
+
+        主循环据此决定走流式还是非流式调用路径（对应原版 run_agent.py:6418）。
+        """
+        return (
+            getattr(self, "stream_delta_callback", None) is not None
+            or getattr(self, "_stream_callback", None) is not None
+        )
+
+    def _reset_stream_delivery_tracking(self) -> None:
+        """重置流式交付跟踪状态（每轮 API 调用前调用）。
+
+        对应原版 run_agent.py:6022；精简版只清累积文本，不做 scrubber 冲刷。
+        """
+        self._current_streamed_assistant_text = ""
+
+    def _try_activate_fallback(self, reason=None) -> bool:
+        """切到回退链的下一个 provider（重试耗尽后调用）。
+
+        Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``。
+        返回 False 表示链耗尽或无可用回退。
+        """
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        return try_activate_fallback(self, reason)
+
+    def _restore_primary_runtime(self) -> bool:
+        """恢复主 provider 运行时（每轮开始调用）。
+
+        Forwarder — see ``agent.chat_completion_helpers.restore_primary_runtime``。
+        """
+        from agent.chat_completion_helpers import restore_primary_runtime
+
+        return restore_primary_runtime(self)
+
+    def _has_pending_fallback(self) -> bool:
+        """回退链是否还有可用项（对应原版 run_agent.py:6437）。"""
+        chain = getattr(self, "_fallback_chain", None) or []
+        index = getattr(self, "_fallback_index", 0)
+        return index < len(chain)
 
     def request_interrupt(self) -> None:
         """请求中断当前轮次：置位 _interrupt_requested。

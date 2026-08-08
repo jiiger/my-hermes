@@ -10,8 +10,19 @@
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.error_classifier import FailoverReason, classify_api_error
+from agent.middleware import run_llm_execution_middleware
 from agent.process_bootstrap import _install_safe_stdio
 from agent.turn_context import build_turn_context
+
+# 回退无意义的错误类别：上下文超长/载荷过大/格式/策略问题，
+# 换 provider 也不会成功（压缩或改提示词才是正解，精简版直接失败）
+_NO_FALLBACK_REASONS = {
+    FailoverReason.context_overflow,
+    FailoverReason.payload_too_large,
+    FailoverReason.format_error,
+    FailoverReason.content_policy_blocked,
+}
 
 
 def _restore_or_build_system_prompt(
@@ -146,6 +157,10 @@ def run_conversation(
     )
     _turn_exit_reason = "completed"  # 轮次退出原因（中断/预算/API失败/正常完成）
 
+    # 每轮开始恢复主 provider：上一轮若发生过回退（fallback），这轮从
+    # 主 provider 重新开始；限流冷却期内跳过恢复，保持当前回退 provider
+    agent._restore_primary_runtime()
+
     # ══════════════════════════════════════════════════════════════
     # 主循环：每轮 = "调 API → 有工具调用就执行工具继续下一轮，
     #               否则拿到最终回答退出"。最多跑 max_iterations 轮，
@@ -247,9 +262,19 @@ def run_conversation(
         api_request_id = f"{turn_id}:api:{api_call_count}"  # 每次调用一个请求ID
         agent._current_api_request_id = api_request_id
 
-        # ⑧ 内层循环：真正的 API 调用 + 失败重试。
-        #    精简版直接走 OpenAI SDK 的 chat.completions.create（非流式），
-        #    原版的流式/回退/中间件等机制已裁剪
+        # ⑧ 内层循环：真正的 API 调用 + 失败重试（可中断 + 中间件 + 回退）。
+        #    有流式消费者（stream_callback）→ 走流式，逐增量触发回调；
+        #    否则走非流式。两条路径都可在调用期间响应中断
+
+        def _perform_api_call(_api_kwargs: Dict[str, Any]):
+            """实际发起 API 调用（中间件链的最内层）。
+
+            有流式消费者 → 流式（逐增量触发回调）；否则非流式。
+            """
+            if agent._has_stream_consumers():
+                return agent._interruptible_streaming_api_call(_api_kwargs)
+            return agent._interruptible_api_call(_api_kwargs)
+
         while retry_count < max_retries:
             try:
                 api_kwargs: Dict[str, Any] = {
@@ -258,12 +283,38 @@ def run_conversation(
                 }
                 if tools_for_api:
                     api_kwargs["tools"] = tools_for_api
-                response = agent.client.chat.completions.create(**api_kwargs)
+                # 经 LLM 执行中间件链发起调用（未注册任何中间件时零开销直通）
+                response = run_llm_execution_middleware(
+                    api_kwargs,
+                    _perform_api_call,
+                    agent=agent,
+                    api_call_count=api_call_count,
+                )
                 break  # 成功拿到响应，退出重试循环
+            except InterruptedError:
+                # 用户中断：不重试，整轮退出（与循环顶部的中断检查殊途同归）
+                interrupted = True
+                _turn_exit_reason = "interrupted_by_user"
+                break
             except Exception as exc:
                 retry_count += 1
                 if retry_count >= max_retries:
-                    # 重试耗尽：本轮标记失败，错误信息作为最终回复返回
+                    # 重试耗尽：分类错误 → 有可回退的 provider 就切换后重新重试；
+                    # 链耗尽或错误类别回退无意义（_NO_FALLBACK_REASONS）→ 失败
+                    classified = classify_api_error(exc)
+                    if (
+                        classified.reason not in _NO_FALLBACK_REASONS
+                        and agent._has_pending_fallback()
+                        and agent._try_activate_fallback(classified.reason)
+                    ):
+                        retry_count = 0  # 新 provider 上重新开始重试
+                        if not getattr(agent, "quiet_mode", False):
+                            agent._safe_print(
+                                f"🔄 已切换到回退 provider: {agent.model} "
+                                f"（原因: {classified.reason.value}）"
+                            )
+                        continue
+                    # 回退不可用：本轮标记失败，错误信息作为最终回复返回
                     failed = True
                     _turn_exit_reason = "api_failed"
                     final_response = f"API 调用失败（已重试 {max_retries} 次）: {exc}"
@@ -274,7 +325,7 @@ def run_conversation(
                         f"{exc}，准备重试..."
                     )
 
-        if failed:
+        if failed or interrupted:
             break
         if response is None:
             # 防御：重试循环因故退出但没有响应（正常不会走到）
