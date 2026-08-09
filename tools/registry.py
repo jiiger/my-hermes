@@ -151,6 +151,24 @@ class ToolRegistry:
         entry = self.get_entry(name)
         return (entry.emoji if entry and entry.emoji else default)
 
+    def get_max_result_size(self, name: str, default: int | float | None = None) -> int | float:
+        """返回工具的 max_result_size（用于结果持久化阈值）。
+
+        对应原版 registry.py:796 get_max_result_size()；供
+        tools/budget_config.py 的 resolve_threshold 使用（第 2 批移植
+        预算链时补齐的方法）。优先级：工具注册的 max_result_size_chars
+        → 调用方给的 default → budget_config 的全局默认。
+        """
+        entry = self.get_entry(name)
+        if entry and entry.max_result_size_chars is not None:
+            return entry.max_result_size_chars
+        if default is not None:
+            return default
+        # 函数内 import 避免与 tools.budget_config 的循环导入
+        # （budget_config.resolve_threshold 也是函数内 import registry）。
+        from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
+        return DEFAULT_RESULT_SIZE_CHARS
+
     def get_tool_to_toolset_map(self) -> Dict[str, str]:
         """返回 {工具名: toolset} 映射（对应原版 registry.py:851）。"""
         with self._lock:

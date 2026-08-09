@@ -322,39 +322,43 @@ class AIAgent:
         effective_task_id: str,
         api_call_count: int = 0,
     ) -> None:
-        """顺序执行 assistant 消息里的工具调用，并把结果追加进 messages。
+        """工具执行转发器：单调用走 sequential，多调用走 concurrent。
 
         对应原版 run_agent.py:7589 的 _execute_tool_calls；精简版不做
-        并发/分段调度，按声明顺序逐个执行：
-        - 参数解析失败 → 按空参执行；
-        - 工具未注册（不在 _tool_impls 里）→ 结果写错误信息；
-        - 工具执行抛异常 → 结果写异常信息（fail-open，对话循环可继续）。
-        执行结果以 role="tool" 消息追加，模型下一轮就能看到。
+        分段调度（execute_tool_calls_segmented 未移植），直接两分支转发
+        给 agent/tool_executor.py：
+        - len(tool_calls) <= 1 → execute_tool_calls_sequential；
+        - 否则 → execute_tool_calls_concurrent。
+        工具执行契约（_tool_impls 调用、未注册写错误串、异常 fail-open、
+        结果 role="tool" 追加）由 tool_executor 保持一致。
         """
-        del effective_task_id, api_call_count  # 精简版未使用；保留参数以对齐原版签名
-        import json
+        # 函数内 import：agent.tool_executor 依赖 agent.tool_dispatch_helpers，
+        # 避免在模块加载期形成循环导入。
+        from agent.tool_executor import (
+            execute_tool_calls_concurrent,
+            execute_tool_calls_sequential,
+        )
 
-        tool_impls = getattr(self, "_tool_impls", {})
-        for tc in assistant_message.tool_calls or []:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-            impl = tool_impls.get(name)
-            if impl is None:
-                result = f"错误: 未注册的工具 {name}"
-            else:
-                try:
-                    result = impl(**args)
-                except Exception as exc:
-                    result = f"工具执行异常: {type(exc).__name__}: {exc}"
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "name": name,
-                "content": str(result),
-            })
+        tool_calls = assistant_message.tool_calls
+
+        # TODO: 接入 agent.tool_dispatch_helpers._plan_tool_batch_segments 做
+        # 并行安全规划（原版 run_agent.py:7589 的完整流程）：先用 planner
+        # 判定整批是否可并行，同一文件的写→读冲突应拆成顺序段，而不是当前
+        # "len<=1 顺序 / 否则全并发" 的简化两分支。planner 已移植且有测试
+        # （tests/test_tool_dispatch_helpers.py），接线后并发时的写→读竞态
+        # 可被自动拆开。
+        # 允许工具执行期间使用 _vprint/打印（原版转发器同样置位）
+        self._executing_tools = True
+        try:
+            if len(tool_calls) <= 1:
+                return execute_tool_calls_sequential(
+                    self, assistant_message, messages, effective_task_id, api_call_count
+                )
+            return execute_tool_calls_concurrent(
+                self, assistant_message, messages, effective_task_id, api_call_count
+            )
+        finally:
+            self._executing_tools = False
 
     def run_conversation(
         self,
