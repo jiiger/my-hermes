@@ -307,12 +307,24 @@ def init_agent(
             )
 
     # ══════════════════════════════════════════════════════════════
-    # ⑪ 工具注册（原版 agent_init.py:1438-1447；精简版无 toolsets 系统，
-    #    用空注册口占位，构造后直接赋值 agent.tools / _tool_impls 即可注册）
+    # ⑪ 工具注册（原版 agent_init.py:1438-1447；精简版从 model_tools 装配：
+    #    显式导入工具模块触发自注册 → 按 enabled/disabled_toolsets 过滤
+    #    生成 OpenAI 格式 schema → 生成 {工具名: handler} 实现映射）
     # ══════════════════════════════════════════════════════════════
-    agent.tools = []  # OpenAI 格式的工具 schema 列表（主循环作为 tools= 传给 API）
-    agent.valid_tool_names = set()  # 合法工具名集合（校验用）
-    agent._tool_impls = {}  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
+    # 函数内 import 避免循环导入（model_tools → tools.* → tools.registry）
+    from model_tools import build_tool_impls_map, get_tool_definitions
+
+    agent.tools = get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=agent.quiet_mode,
+    )  # OpenAI 格式的工具 schema 列表（主循环作为 tools= 传给 API）
+    agent.valid_tool_names = {
+        t["function"]["name"] for t in agent.tools
+    }  # 合法工具名集合（校验用）
+    agent._tool_impls = (
+        build_tool_impls_map()
+    )  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
 
     # ══════════════════════════════════════════════════════════════
     # ⑫ session 生成（原版 agent_init.py:1497-1505）

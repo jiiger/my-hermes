@@ -15,8 +15,9 @@ import os
 import sys
 from pathlib import Path
 
-# 保证从任意目录运行都能 import 项目模块
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 保证从任意目录运行都能 import 项目模块（项目根目录；editable 安装的
+# finder 不覆盖新增的 tools/ 包，故显式把项目根加进 sys.path）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 加载项目根目录的 .env（凭据配置：OPENAI_API_KEY / DEEPSEEK_API_KEY /
 # OPENAI_BASE_URL / OPENAI_MODEL）。python-dotenv 已随依赖安装。
