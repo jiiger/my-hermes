@@ -386,6 +386,11 @@ def run_conversation(
     # ══════════════════════════════════════════════════════════════
     # 收尾：组装结果 dict（对应原版 finalize_turn 的简化替代）
     # ══════════════════════════════════════════════════════════════
+    # turn 结束时消费中断标志（对应原版 turn_finalizer.py:693 的
+    # clear_interrupt()）。这样用户的一次中断只影响当前轮，不会
+    # 污染下一轮对话。
+    agent.clear_interrupt()
+
     return {
         "final_response": final_response,
         "messages": messages,

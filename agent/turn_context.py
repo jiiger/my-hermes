@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from agent.iteration_budget import IterationBudget
+
 
 @dataclass
 class TurnContext:
@@ -108,6 +110,11 @@ def build_turn_context(
     if not getattr(agent, "quiet_mode", False):
         _preview = summarize_user_message_for_log(user_message)
         print(f"💬 Starting conversation: '{_preview}'")
+
+    # 每轮对话开始时重建独立迭代预算（对应原版 turn_context.py:500）。
+    # 同一个 agent 连续多轮对话时，每轮都拿到满额预算，互不蚕食；
+    # 原版同样以「换新对象」而非 reset() 实现轮次间预算重置。
+    agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     return TurnContext(
         user_message=user_message,

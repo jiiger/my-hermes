@@ -11,9 +11,11 @@
     /quit       退出（或 Ctrl+C / Ctrl+D）
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 # 保证从任意目录运行都能 import 项目模块（项目根目录；editable 安装的
 # finder 不覆盖新增的 tools/ 包，故显式把项目根加进 sys.path）
@@ -123,7 +125,21 @@ def once(agent: AIAgent, query: str) -> None:
         sys.exit(1)
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
+    # argparse 解析（对应原版 hermes_cli/main.py 的 argparse 体系）：
+    # --help 在任何凭据检查之前由 argparse 处理并 SystemExit(0)，
+    # 因此帮助信息不依赖 API 凭据。
+    parser = argparse.ArgumentParser(
+        prog="hermes-agent",
+        description="my-hermes 简单对话 CLI",
+    )
+    parser.add_argument(
+        "query",
+        nargs="*",
+        help="单次查询内容（不传则进入交互模式）",
+    )
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+
     # 凭据：环境变量 > .env 文件（load_dotenv 已在模块顶部执行）> 交互输入
     api_key = (
         os.getenv("OPENAI_API_KEY")
@@ -156,8 +172,8 @@ def main() -> None:
     _print_banner(agent)
 
     # 带位置参数 → 单次查询；否则交互模式
-    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
-        once(agent, " ".join(sys.argv[1:]))
+    if args.query:
+        once(agent, " ".join(args.query))
     else:
         interactive(agent)
 

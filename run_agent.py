@@ -315,6 +315,18 @@ class AIAgent:
         """
         self._interrupt_requested = True
 
+    def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
+        """消费中断请求：清掉 _interrupt_requested，让下一轮对话不受旧中断影响。
+
+        对应原版 run_agent.py:3170 clear_interrupt()，由 turn 收尾调用
+        （原版在 turn_finalizer 中调用）。my-hermes 精简版没有
+        _interrupt_message / _hard_interrupt_requested / _pending_redirect
+        状态，只清软中断标志；preserve_redirect 参数保留以对齐原版签名
+        （本版恒无 pending redirect 场景）。
+        """
+        self._interrupt_requested = False
+        return True
+
     def _execute_tool_calls(
         self,
         assistant_message,
