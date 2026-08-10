@@ -319,15 +319,20 @@ class AIAgent:
         self._interrupt_requested = True
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
-        """消费中断请求：清掉 _interrupt_requested，让下一轮对话不受旧中断影响。
+        """消费中断请求，让下一轮对话不受旧中断影响。
 
-        对应原版 run_agent.py:3170 clear_interrupt()，由 turn 收尾调用
-        （原版在 turn_finalizer 中调用）。my-hermes 精简版没有
-        _interrupt_message / _hard_interrupt_requested / _pending_redirect
-        状态，只清软中断标志；preserve_redirect 参数保留以对齐原版签名
-        （本版恒无 pending redirect 场景）。
+        返回值语义对齐原版 run_agent.py:3237：``preserve_redirect=True``
+        且当前没有可保留的 ``_pending_redirect`` 时返回 False（表示没有
+        可保留的重定向，调用方应中止重建），否则清中断并返回 True。
+        ``preserve_redirect`` 由对话循环在主动取消模型请求、重建同一逻辑
+        轮次时使用；my-hermes 精简版无 _interrupt_message /
+        _hard_interrupt_requested 状态，只清软中断标志与 pending redirect。
         """
+        if preserve_redirect and not getattr(self, "_pending_redirect", None):
+            return False
         self._interrupt_requested = False
+        if not preserve_redirect:
+            self._pending_redirect = None
         return True
 
     def _execute_tool_calls(

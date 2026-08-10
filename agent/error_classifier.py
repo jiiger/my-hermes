@@ -7,7 +7,7 @@
 
 import enum
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 class FailoverReason(enum.Enum):
@@ -51,18 +51,33 @@ class FailoverReason(enum.Enum):
 
 @dataclass
 class ClassifiedError:
-    """一次 API 错误的分类结果（对应原版 ClassifiedError 的精简版）。
+    """一次 API 错误的分类结果（字段对齐原版 agent/error_classifier.py:77）。
 
     - reason: 失败原因（FailoverReason），上层据此决定 重试/回退/压缩；
     - status_code: 原始 HTTP 状态码（可能没有）；
+    - provider / model: 出错时的 provider 与模型（诊断/恢复用）；
     - message: 原始错误消息（保留用于日志/展示）；
-    - retryable: 该错误是否值得原样重试（auth/计费/策略拦截等重试无意义）。
+    - error_context: 附加错误上下文（响应 body、错误码等）；
+    - retryable: 该错误是否值得原样重试（auth/计费/策略拦截等重试无意义）；
+    - should_compress / should_rotate_credential / should_fallback: 恢复动作提示，
+      重试循环直接按此执行，不必再自行分类。
     """
 
     reason: FailoverReason
     status_code: Optional[int] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
     message: str = ""
+    error_context: Dict[str, Any] = field(default_factory=dict)
     retryable: bool = True
+    should_compress: bool = False
+    should_rotate_credential: bool = False
+    should_fallback: bool = False
+
+    @property
+    def is_auth(self) -> bool:
+        """是否认证类失败（含刷新后仍失败的彻底失败）。"""
+        return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
 
 
 # ── 关键词模式（状态码缺失时的兜底判断）──────────────────────────────────
@@ -167,54 +182,54 @@ def classify_api_error(
     if status_code is not None:
         if status_code in (401, 403):
             # 认证失败：换凭据/回退，原样重试无意义
-            return ClassifiedError(FailoverReason.auth, status_code, str(error), retryable=False)
+            return ClassifiedError(reason=FailoverReason.auth, status_code=status_code, message=str(error), retryable=False)
         if status_code == 402:
             # 余额不足：立即切换 provider
-            return ClassifiedError(FailoverReason.billing, status_code, str(error), retryable=False)
+            return ClassifiedError(reason=FailoverReason.billing, status_code=status_code, message=str(error), retryable=False)
         if status_code == 429:
-            return ClassifiedError(FailoverReason.rate_limit, status_code, str(error))
+            return ClassifiedError(reason=FailoverReason.rate_limit, status_code=status_code, message=str(error))
         if status_code == 404:
             # 模型不存在：换模型/回退
-            return ClassifiedError(FailoverReason.model_not_found, status_code, str(error), retryable=False)
+            return ClassifiedError(reason=FailoverReason.model_not_found, status_code=status_code, message=str(error), retryable=False)
         if status_code == 413:
-            return ClassifiedError(FailoverReason.payload_too_large, status_code, str(error))
+            return ClassifiedError(reason=FailoverReason.payload_too_large, status_code=status_code, message=str(error))
         if status_code in (500, 502):
-            return ClassifiedError(FailoverReason.server_error, status_code, str(error))
+            return ClassifiedError(reason=FailoverReason.server_error, status_code=status_code, message=str(error))
         if status_code in (503, 529):
-            return ClassifiedError(FailoverReason.overloaded, status_code, str(error))
+            return ClassifiedError(reason=FailoverReason.overloaded, status_code=status_code, message=str(error))
         if status_code == 400:
             # 400 最模糊：按消息细分
             if _contains_any(msg, _CONTEXT_PATTERNS):
-                return ClassifiedError(FailoverReason.context_overflow, status_code, str(error))
+                return ClassifiedError(reason=FailoverReason.context_overflow, status_code=status_code, message=str(error))
             if _contains_any(msg, _POLICY_PATTERNS):
                 return ClassifiedError(
-                    FailoverReason.content_policy_blocked, status_code, str(error), retryable=False
+                    reason=FailoverReason.content_policy_blocked, status_code=status_code, message=str(error), retryable=False
                 )
-            return ClassifiedError(FailoverReason.format_error, status_code, str(error), retryable=False)
+            return ClassifiedError(reason=FailoverReason.format_error, status_code=status_code, message=str(error), retryable=False)
         if 400 <= status_code < 500:
-            return ClassifiedError(FailoverReason.format_error, status_code, str(error), retryable=False)
+            return ClassifiedError(reason=FailoverReason.format_error, status_code=status_code, message=str(error), retryable=False)
         if status_code >= 500:
-            return ClassifiedError(FailoverReason.server_error, status_code, str(error))
+            return ClassifiedError(reason=FailoverReason.server_error, status_code=status_code, message=str(error))
 
     # ── 2) 无状态码：按异常类型 / 消息关键词 ──
     if error_type in ("APITimeoutError", "TimeoutError") or _contains_any(msg, _TIMEOUT_PATTERNS):
-        return ClassifiedError(FailoverReason.timeout, None, str(error))
+        return ClassifiedError(reason=FailoverReason.timeout, status_code=None, message=str(error))
     if error_type in ("APIConnectionError", "ConnectionError") or _contains_any(msg, _CONNECT_PATTERNS):
-        return ClassifiedError(FailoverReason.timeout, None, str(error))
+        return ClassifiedError(reason=FailoverReason.timeout, status_code=None, message=str(error))
     if error_type == "RateLimitError" or _contains_any(msg, _RATE_LIMIT_PATTERNS):
-        return ClassifiedError(FailoverReason.rate_limit, None, str(error))
+        return ClassifiedError(reason=FailoverReason.rate_limit, status_code=None, message=str(error))
     if _contains_any(msg, _SSL_PATTERNS):
-        return ClassifiedError(FailoverReason.ssl_cert_verification, None, str(error))
+        return ClassifiedError(reason=FailoverReason.ssl_cert_verification, status_code=None, message=str(error))
     if _contains_any(msg, _AUTH_PATTERNS):
-        return ClassifiedError(FailoverReason.auth, None, str(error), retryable=False)
+        return ClassifiedError(reason=FailoverReason.auth, status_code=None, message=str(error), retryable=False)
     if _contains_any(msg, _BILLING_PATTERNS):
-        return ClassifiedError(FailoverReason.billing, None, str(error), retryable=False)
+        return ClassifiedError(reason=FailoverReason.billing, status_code=None, message=str(error), retryable=False)
     if _contains_any(msg, _CONTEXT_PATTERNS):
-        return ClassifiedError(FailoverReason.context_overflow, None, str(error))
+        return ClassifiedError(reason=FailoverReason.context_overflow, status_code=None, message=str(error))
     if _contains_any(msg, _POLICY_PATTERNS):
         return ClassifiedError(
-            FailoverReason.content_policy_blocked, None, str(error), retryable=False
+            reason=FailoverReason.content_policy_blocked, status_code=None, message=str(error), retryable=False
         )
 
     # ── 3) 兜底：无法分类，带退避重试 ──
-    return ClassifiedError(FailoverReason.unknown, status_code, str(error))
+    return ClassifiedError(reason=FailoverReason.unknown, status_code=status_code, message=str(error))
