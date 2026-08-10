@@ -349,9 +349,16 @@ def init_agent(
     # ══════════════════════════════════════════════════════════════
     # ⑬ 重试（原版 agent_init.py:1851）
     # ══════════════════════════════════════════════════════════════
-    # TODO _raw_api_retries = _agent_section.get("api_max_retries", 3)，读取config
+    # 从 config.yaml 读取 agent.api_max_retries（缺省 3），失败时兜底 3
     try:
+        from hermes_cli.config import load_config_readonly
+
+        _raw_api_retries = (load_config_readonly().get("agent", {}) or {}).get(
+            "api_max_retries", 3
+        )
+    except Exception:
         _raw_api_retries = 3
+    try:
         _api_retries = int(_raw_api_retries)
         _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
     except (TypeError, ValueError):
