@@ -4,7 +4,13 @@
     python cli.py                      # 交互模式（多轮对话，自动保留上下文）
     python cli.py "你的问题"            # 单次查询模式
 
-凭据从环境变量读取：OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+参数解析优先级（对齐原版 hermes 的"config.yaml 为中心"）：
+    1. config.yaml：model.default / model.provider / model.base_url；
+       api_key 按 providers.<provider>.key_env（环境变量名）→
+       providers.<provider>.api_key（硬编码）→ <PROVIDER>_API_KEY 环境变量
+       依次解析（.env 里只放 API key，模型/端点配置都在 config.yaml）
+    2. 向后兼容兜底：OPENAI_MODEL / OPENAI_BASE_URL / OPENAI_PROVIDER /
+       OPENAI_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY 环境变量
 
 交互模式命令：
     /new        开启新会话（清空上下文）
@@ -27,6 +33,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent / "../.env")
 
+from hermes_constants import get_hermes_home  # noqa: E402
 from run_agent import AIAgent  # noqa: E402
 
 try:
@@ -78,6 +85,89 @@ def _ask(text: str) -> str:
 def _stream_print(text: str) -> None:
     """流式回调：逐段打印（打字机效果，不换行）。"""
     print(text, end="", flush=True)
+
+
+def _api_key_env_for_provider(provider: str) -> str:
+    """按原版约定把 provider 名映射为 api_key 环境变量名。
+
+    规则：大写 + 连字符转下划线 + ``_API_KEY``（对齐原版 runtime_provider
+    按 hostname 推断 key 变量的思路，如 opencode-go → OPENCODE_GO_API_KEY、
+    deepseek → DEEPSEEK_API_KEY）。
+    """
+    if not provider:
+        return ""
+    return provider.upper().replace("-", "_") + "_API_KEY"
+
+
+def _resolve_runtime_from_config() -> tuple[str, str, str, str]:
+    """从 config.yaml 读取运行参数 (model, provider, base_url, api_key)。
+
+    对齐原版"config.yaml 为中心"的解析（runtime_provider 的简化版）：
+    - model.default（别名 model.model）→ model
+    - model.provider → provider
+    - model.base_url → base_url
+    - api_key 依次尝试：
+      1. providers.<provider>.key_env（别名 api_key_env）指向的环境变量
+      2. providers.<provider>.api_key（config 硬编码，key_env 缺失时兜底）
+      3. 按 provider 推断 <PROVIDER>_API_KEY 环境变量（config 无 providers
+         段时，如 opencode-go → OPENCODE_GO_API_KEY）
+    读取失败/无配置时返回四个空字符串。
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        model_cfg = cfg.get("model") or {}
+        model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        provider = str(model_cfg.get("provider") or "").strip().lower()
+        base_url = str(model_cfg.get("base_url") or "").strip()
+
+        api_key = ""
+        providers_cfg = cfg.get("providers")
+        entry = providers_cfg.get(provider) if isinstance(providers_cfg, dict) else None
+        if isinstance(entry, dict):
+            key_env = str(
+                entry.get("key_env") or entry.get("api_key_env") or ""
+            ).strip()
+            if key_env:
+                api_key = os.getenv(key_env) or ""
+            if not api_key:
+                api_key = str(entry.get("api_key") or "").strip()
+        if not api_key:
+            api_key = os.getenv(_api_key_env_for_provider(provider)) or ""
+        return model, provider, base_url, api_key
+    except Exception:
+        return "", "", "", ""
+
+
+def _resolve_runtime() -> tuple[str, str, str, str]:
+    """解析运行参数 (api_key, base_url, model, provider)。
+
+    对齐原版优先级：
+    - model / provider / base_url：config.yaml（model 段）优先，
+      OPENAI_MODEL / OPENAI_BASE_URL / OPENAI_PROVIDER 环境变量兜底
+      （my-hermes 旧 .env 习惯的向后兼容）；
+    - api_key：config 解析结果（key_env → inline → <PROVIDER>_API_KEY）
+      优先，OPENAI_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY 兜底。
+    附带加载 HERMES_HOME/.env（用户级凭据文件，key_env 与
+    <PROVIDER>_API_KEY 的值常来自这里）。
+    """
+    # 补加载用户级 .env（HERMES_HOME/.env，若存在）。项目根 .env 已在
+    # 模块顶部加载；用户级文件按原版语义优先（override=True）。
+    user_env = get_hermes_home() / ".env"
+    if user_env.exists():
+        load_dotenv(user_env, override=True)
+
+    cfg_model, cfg_provider, cfg_base_url, cfg_api_key = _resolve_runtime_from_config()
+    model = cfg_model or os.getenv("OPENAI_MODEL") or ""
+    provider = cfg_provider or os.getenv("OPENAI_PROVIDER") or ""
+    base_url = cfg_base_url or os.getenv("OPENAI_BASE_URL") or ""
+    api_key = cfg_api_key or (
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("DEEPSEEK_API_KEY")
+        or os.getenv("OPENROUTER_API_KEY")
+    ) or ""
+    return api_key, base_url, model, provider
 
 
 def interactive(agent: AIAgent) -> None:
@@ -140,14 +230,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    # 凭据：环境变量 > .env 文件（load_dotenv 已在模块顶部执行）> 交互输入
-    api_key = (
-        os.getenv("OPENAI_API_KEY")
-        or os.getenv("DEEPSEEK_API_KEY")
-        or os.getenv("OPENROUTER_API_KEY")
-    )
-    base_url = os.getenv("OPENAI_BASE_URL") or ""
-    model = os.getenv("OPENAI_MODEL") or ""
+    # 参数解析：环境变量/.env > config.yaml（_resolve_runtime 内部实现）
+    api_key, base_url, model, provider = _resolve_runtime()
 
     if not api_key and not base_url:
         print(
@@ -155,6 +239,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "  export OPENAI_API_KEY=sk-xxx\n"
             "  export OPENAI_BASE_URL=https://api.deepseek.com/v1   # 以 DeepSeek 为例\n"
             "  export OPENAI_MODEL=deepseek-chat\n"
+            "或在 ~/.hermes/config.yaml 配置 model 段与 providers.<name> 段\n"
         )
         sys.exit(1)
 
@@ -163,7 +248,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             api_key=api_key,
             base_url=base_url,
             model=model,
-            provider=(os.getenv("OPENAI_PROVIDER") or ""),
+            provider=provider,
         )
     except RuntimeError as exc:
         print(f"❌ Agent 初始化失败: {exc}")

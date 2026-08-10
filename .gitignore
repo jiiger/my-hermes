@@ -68,6 +68,8 @@ test-results/
 
 # CLI config (may contain sensitive SSH paths)
 cli-config.yaml
+# 本地配置文件（含个人偏好/凭据引用，不入库）
+config.yaml
 
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
