@@ -206,3 +206,16 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     )
     agent._cached_system_prompt = joined
     return joined
+
+
+def invalidate_system_prompt(agent: Any) -> None:
+    """清空缓存的系统提示词，强制下一轮重建。
+
+    对应原版 agent/system_prompt.py:invalidate_system_prompt（原版在上下文
+    压缩后调用）。精简版差异：
+    - 没有 _cached_system_prompt_static 两段式布局，只清 _cached_system_prompt；
+    - 记忆模块未实现时 _memory_store 为 None，跳过磁盘重载。
+    """
+    agent._cached_system_prompt = None
+    if agent._memory_store:
+        agent._memory_store.load_from_disk()

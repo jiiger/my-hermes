@@ -790,6 +790,27 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         return ""
 
 
+def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+    """AGENTS.md — top-level only (no recursive walk)."""
+    for name in ["AGENTS.md", "agents.md"]:
+        candidate = cwd_path / name
+        if candidate.exists():
+            try:
+                content = candidate.read_text(encoding="utf-8").strip()
+                if content:
+                    content = _scan_context_content(content, name)
+                    result = f"## {name}\n\n{content}"
+                    return _truncate_content(
+                        result,
+                        "AGENTS.md",
+                        context_length=context_length,
+                        read_path=str(candidate),
+                    )
+            except Exception as e:
+                logger.debug("Could not read %s: %s", candidate, e)
+    return ""
+
+
 def build_context_files_prompt(
     cwd: Optional[str] = None,
     skip_soul: bool = False,
@@ -849,7 +870,7 @@ def build_context_files_prompt(
         # TODO 加载agent.md,claude.md,cursorrules...
         project_context = (
             _load_hermes_md(cwd_path, context_length)
-            # or _load_agents_md(cwd_path, context_length)
+            or _load_agents_md(cwd_path, context_length)
             # or _load_claude_md(cwd_path, context_length)
             # or _load_cursorrules(cwd_path, context_length)
         )
