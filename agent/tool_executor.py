@@ -21,9 +21,12 @@ _execute_tool_calls_concurrent）在这里作为接受父 AIAgent 作为首参�
 - 超阈值结果经 maybe_persist_tool_result 持久化，批末
   enforce_turn_budget 聚合（finalize）。
 
+精简版改动：
+- execute_tool_calls_segmented（原版 :2274）已移植为精简版：砍掉
+  get_active_env / _incremental_persistence_failed /
+  _apply_pending_steer_to_tool_results，execution_cwd 恒为 None；
+
 砍掉（my-hermes 无对应系统，抄了直接 ImportError）：
-- execute_tool_calls_segmented（原版 :2274，分段调度；run_agent 转发器
-  直接两分支，注释说明）；
 - relay_tools / mcp_tool / environments.base / daemon_pool / tool_search /
   clarify_tool / memory_tool / read_preview_tool / read_terminal_tool /
   session_search / hermes_cli.middleware 等一切懒加载外部依赖；
@@ -43,6 +46,7 @@ import threading
 import time
 from typing import Any, Optional
 
+from agent.tool_dispatch_helpers import _plan_tool_batch_segments
 from tools.budget_config import DEFAULT_BUDGET, BudgetConfig, budget_for_context_window
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import enforce_turn_budget, maybe_persist_tool_result
@@ -157,7 +161,8 @@ def execute_tool_calls_concurrent(
     的顺序与模型发出的一致。
 
     ``finalize=False`` 跳过批末聚合预算执行 —— 原版用于分段调度器；
-    my-hermes 只有两个入口，调用方恒为 True（保留参数以对齐签名）。
+    分段接线后 execute_tool_calls_segmented 会以 False 传入各段，最终
+    由整轮收尾统一聚合一次。
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
@@ -268,8 +273,9 @@ def execute_tool_calls_sequential(
 ) -> None:
     """顺序执行工具调用（原版行为；单调用或交互工具使用）。
 
-    对应原版 :1531。``finalize=False`` 跳过批末聚合预算执行（保留参数
-    以对齐签名；my-hermes 恒为 True）。
+    对应原版 :1531。``finalize=False`` 跳过批末聚合预算执行 —— 分段
+    调度器（execute_tool_calls_segmented）会以 False 传入各段，最终由
+    整轮收尾统一聚合一次。
     """
     # 每轮解析一次上下文缩放的预算
     _tool_budget = _budget_for_agent(agent)
@@ -339,3 +345,57 @@ def execute_tool_calls_sequential(
     num_tools_seq = len(tool_calls)
     if finalize and num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], config=_tool_budget)
+
+
+def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+    """把混合工具调用批按有序的并行/顺序段执行（原版 :2274 精简版）。
+
+    ``segments`` 是 ``_plan_tool_batch_segments`` 生成的 ``(kind, calls)``
+    规划：并行安全的极大连续运行走并发路径，barrier 调用走顺序路径，
+    严格保持模型原始调用顺序。因为段是连续的，每条工具结果仍按发出顺序
+    逐条追加，任何调用都不会早于前面的 barrier 结束 —— 与完全顺序执行
+    拥有相同的顺序和副作用边界，同时在安全区间内恢复 I/O 并行。
+
+    整轮收尾（聚合预算）在这里对整个批只做一次；各段执行器以
+    ``finalize=False`` 运行，避免多段轮次重复聚合预算。
+
+    中断语义：各段执行器开头都检查 ``agent._interrupt_requested`` 并为
+    每条调用追加取消/跳过结果，因此第 k 段中断会排空 k+1..n 段而不
+    执行它们，同时为每个 tool_call_id 保留一条结果。
+
+    精简版改动（相对原版 :2274）：
+    - my-hermes 没有 get_active_env：``segments is None`` 时以
+      execution_cwd=None 调用规划器（planner 内部回退 Path.cwd()）；
+    - my-hermes 没有 _incremental_persistence_failed 与
+      _apply_pending_steer_to_tool_results：对应检查与 /steer 收尾调用
+      直接去掉；
+    - enforce_turn_budget 用 my-hermes 现有签名（无 env 参数，见 :48
+      导入与 :257 调用）。
+    """
+    from types import SimpleNamespace
+
+    if segments is None:
+        # my-hermes 无 get_active_env，execution_cwd 恒为 None（planner
+        # 内部回退 Path.cwd()）
+        segments = _plan_tool_batch_segments(
+            assistant_message.tool_calls, execution_cwd=None
+        )
+
+    for kind, calls in segments:
+        segment_message = SimpleNamespace(tool_calls=list(calls))
+        if kind == "parallel":
+            execute_tool_calls_concurrent(
+                agent, segment_message, messages, effective_task_id, api_call_count,
+                finalize=False,
+            )
+        else:
+            execute_tool_calls_sequential(
+                agent, segment_message, messages, effective_task_id, api_call_count,
+                finalize=False,
+            )
+
+    # ── 整轮收尾（聚合预算，对整个批只做一次）──────────
+    total_tools = len(assistant_message.tool_calls)
+    if total_tools > 0:
+        _tool_budget = _budget_for_agent(agent)
+        enforce_turn_budget(messages[-total_tools:], config=_tool_budget)

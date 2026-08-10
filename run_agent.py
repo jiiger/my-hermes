@@ -334,15 +334,14 @@ class AIAgent:
         effective_task_id: str,
         api_call_count: int = 0,
     ) -> None:
-        """工具执行转发器：单调用走 sequential，多调用走 concurrent。
+        """工具执行转发器：按并行安全规划分段调度工具调用。
 
-        对应原版 run_agent.py:7589 的 _execute_tool_calls；精简版不做
-        分段调度（execute_tool_calls_segmented 未移植），直接两分支转发
-        给 agent/tool_executor.py：
-        - len(tool_calls) <= 1 → execute_tool_calls_sequential；
-        - 否则 → execute_tool_calls_concurrent。
-        工具执行契约（_tool_impls 调用、未注册写错误串、异常 fail-open、
-        结果 role="tool" 追加）由 tool_executor 保持一致。
+        对应原版 run_agent.py:7589 的 _execute_tool_calls。分段规划器把
+        整批拆成并行安全的极大连续运行（只读工具、不重叠文件目标）与
+        顺序 barrier（交互/不安全/未识别工具）：同质批保持原有单路径
+        派发；混合批按发出顺序逐段执行，安全子集仍并发、副作用顺序
+        保留。工具执行契约（_tool_impls 调用、未注册写错误串、异常
+        fail-open、结果 role="tool" 追加）由 tool_executor 保持一致。
         """
         # 函数内 import：agent.tool_executor 依赖 agent.tool_dispatch_helpers，
         # 避免在模块加载期形成循环导入。
@@ -353,12 +352,6 @@ class AIAgent:
 
         tool_calls = assistant_message.tool_calls
 
-        # TODO: 接入 agent.tool_dispatch_helpers._plan_tool_batch_segments 做
-        # 并行安全规划（原版 run_agent.py:7589 的完整流程）：先用 planner
-        # 判定整批是否可并行，同一文件的写→读冲突应拆成顺序段，而不是当前
-        # "len<=1 顺序 / 否则全并发" 的简化两分支。planner 已移植且有测试
-        # （tests/test_tool_dispatch_helpers.py），接线后并发时的写→读竞态
-        # 可被自动拆开。
         # 允许工具执行期间使用 _vprint/打印（原版转发器同样置位）
         self._executing_tools = True
         try:
@@ -366,8 +359,36 @@ class AIAgent:
                 return execute_tool_calls_sequential(
                     self, assistant_message, messages, effective_task_id, api_call_count
                 )
-            return execute_tool_calls_concurrent(
-                self, assistant_message, messages, effective_task_id, api_call_count
+
+            from agent.tool_dispatch_helpers import _plan_tool_batch_segments
+
+            # my-hermes 无 get_active_env，不传 execution_cwd
+            # （planner 内部回退 Path.cwd()）
+            segments = _plan_tool_batch_segments(tool_calls)
+
+            if len(segments) == 1:
+                kind = segments[0][0]
+                if kind == "parallel":
+                    return execute_tool_calls_concurrent(
+                        self,
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                return execute_tool_calls_sequential(
+                    self, assistant_message, messages, effective_task_id, api_call_count
+                )
+
+            from agent.tool_executor import execute_tool_calls_segmented
+
+            return execute_tool_calls_segmented(
+                self,
+                assistant_message,
+                messages,
+                effective_task_id,
+                api_call_count,
+                segments=segments,
             )
         finally:
             self._executing_tools = False
