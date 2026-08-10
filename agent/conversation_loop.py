@@ -10,7 +10,6 @@
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.middleware import run_llm_execution_middleware
 from agent.process_bootstrap import _install_safe_stdio
 from agent.turn_context import build_turn_context
 
@@ -271,13 +270,9 @@ def run_conversation(
                 }
                 if tools_for_api:
                     api_kwargs["tools"] = tools_for_api
-                # 经 LLM 执行中间件链发起调用（未注册任何中间件时零开销直通）
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    agent=agent,
-                    api_call_count=api_call_count,
-                )
+                # 直接发起 API 调用（原版经 LLM 执行中间件链；my-hermes
+                # 无插件系统、无任何注册方，中间件已砍掉）
+                response = _perform_api_call(api_kwargs)
                 break  # 成功拿到响应，退出重试循环
             except InterruptedError:
                 # 用户中断：不重试，整轮退出（与循环顶部的中断检查殊途同归）
