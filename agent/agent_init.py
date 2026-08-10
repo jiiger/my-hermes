@@ -325,6 +325,13 @@ def init_agent(
     agent._tool_impls = (
         build_tool_impls_map()
     )  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
+    # TODO 这些属性被 system_prompt 的守卫读取，先占位 None，做记忆模块时激活
+    agent._memory_store = None  # 记忆存储
+    agent._memory_enabled = False  # 记忆开关
+    agent._memory_manager = None  # 外部记忆提供者（原版 1699）
+    # system_prompt 守卫读取（原版 agent_init.py:1781/613；config 读取未实现，先用默认值）
+    agent._tool_use_enforcement = "auto"  # 工具使用强制指导开关（auto/true/false/list）
+    agent.pass_session_id = pass_session_id  # 是否在系统提示中暴露会话 ID
 
     # ══════════════════════════════════════════════════════════════
     # ⑫ session 生成（原版 agent_init.py:1497-1505）

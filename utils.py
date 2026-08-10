@@ -1,13 +1,31 @@
 import os
+from typing import Any
 from urllib.parse import urlparse
+
+TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+
+def is_truthy_value(value: Any, default: bool = False) -> bool:
+    """Coerce bool-ish values using the project's shared truthy string set."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in TRUTHY_STRINGS
+    return bool(value)
 
 
 # ─── Proxy Helpers ────────────────────────────────────────────────────────────
 
 
 _PROXY_ENV_KEYS = (
-    "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
-    "https_proxy", "http_proxy", "all_proxy",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
 )
 
 
@@ -22,7 +40,7 @@ def normalize_proxy_url(proxy_url: str | None) -> str | None:
     if not candidate:
         return None
     if candidate.lower().startswith("socks://"):
-        return f"socks5://{candidate[len('socks://'):]}"
+        return f"socks5://{candidate[len('socks://') :]}"
     return candidate
 
 
@@ -33,23 +51,20 @@ def normalize_proxy_env_vars() -> None:
         normalized = normalize_proxy_url(value)
         if normalized and normalized != value:
             os.environ[key] = normalized
-            
 
 
 # ─── URL Parsing Helpers ──────────────────────────────────────────────────────
 
 
 def base_url_hostname(base_url: str) -> str:
-    """返回基于url提供的小写主机名
-    """
+    """返回基于url提供的小写主机名"""
     raw = (base_url or "").strip()
     if not raw:
         return ""
     parsed = urlparse(raw if "://" in raw else f"//{raw}")
-    return (parsed.hostname or "").lower().rstrip(".")     
-            
-            
-            
+    return (parsed.hostname or "").lower().rstrip(".")
+
+
 def base_url_host_matches(base_url: str, domain: str) -> bool:
     """Return True when the base URL's hostname is ``domain`` or a subdomain.
 

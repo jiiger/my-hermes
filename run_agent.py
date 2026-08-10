@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, List, Optional
 from agent import relay_runtime
 from agent.iteration_budget import IterationBudget
 from agent.process_bootstrap import OpenAI, _get_proxy_for_base_url
+# 经 run_agent 命名空间暴露给 agent.system_prompt._ra()（测试 patch 契约）
+from agent.prompt_builder import build_environment_hints
 from utils import base_url_hostname
 
 logger = logging.getLogger(__name__)
@@ -608,6 +610,18 @@ class AIAgent:
         except Exception:
             # Never let durable cleanup I/O break turn teardown.
             pass
+
+    def _build_system_prompt_parts(self, system_message: str = None) -> Dict[str, str]:
+        """Forwarder — see ``agent.system_prompt.build_system_prompt_parts``."""
+        from agent.system_prompt import build_system_prompt_parts
+
+        return build_system_prompt_parts(self, system_message=system_message)
+
+    def _build_system_prompt(self, system_message: str = None) -> str:
+        """Forwarder — see ``agent.system_prompt.build_system_prompt``."""
+        from agent.system_prompt import build_system_prompt
+
+        return build_system_prompt(self, system_message=system_message)
 
 
 def main(
