@@ -123,6 +123,12 @@ def _run_tool(
     else:
         try:
             result = impl(**function_args)
+        except KeyboardInterrupt:
+            # Ctrl+C 优雅中断（对齐原版 agent/tool_executor.py:1073）：
+            # 转成协作式中断请求，工具标记为已取消，不冒泡退出
+            agent.request_interrupt()
+            result = "工具执行被用户中断 (keyboard interrupt)"
+            is_error = True
         except Exception as exc:
             result = f"工具执行异常: {type(exc).__name__}: {exc}"
             is_error = True
@@ -309,6 +315,10 @@ def execute_tool_calls_sequential(
         else:
             try:
                 function_result = impl(**function_args)
+            except KeyboardInterrupt:
+                # Ctrl+C 优雅中断（对齐原版 agent/tool_executor.py:2156）
+                agent.request_interrupt()
+                function_result = "工具执行被用户中断 (keyboard interrupt)"
             except Exception as exc:
                 function_result = f"工具执行异常: {type(exc).__name__}: {exc}"
         tool_duration = time.time() - tool_start_time

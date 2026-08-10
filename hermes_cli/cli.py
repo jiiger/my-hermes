@@ -19,7 +19,9 @@
 
 import argparse
 import os
+import select
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional
 
@@ -85,6 +87,18 @@ def _ask(text: str) -> str:
 def _stream_print(text: str) -> None:
     """流式回调：逐段打印（打字机效果，不换行）。"""
     print(text, end="", flush=True)
+
+
+def _read_stdin_available() -> str:
+    """非阻塞读取 stdin 当前可用的输入（对话期间打断用，原版输入线程思路）。
+
+    仅在有数据时被调用（select 已确认可读）；读取失败返回空串。
+    """
+    try:
+        data = os.read(sys.stdin.fileno(), 4096)
+    except (OSError, ValueError):
+        return ""
+    return data.decode("utf-8", errors="replace").strip()
 
 
 def _api_key_env_for_provider(provider: str) -> str:
@@ -171,14 +185,25 @@ def _resolve_runtime() -> tuple[str, str, str, str]:
 
 
 def interactive(agent: AIAgent) -> None:
-    """交互模式：多轮对话，自动把上一轮 messages 传给下一轮。"""
+    """交互模式：多轮对话，自动把上一轮 messages 传给下一轮。
+
+    对话在后台线程执行、主线程监听键盘（对齐原版"输入线程调
+    interrupt"的模式）：输入新内容或按 Ctrl+C 会调用
+    ``agent.request_interrupt()`` 优雅中断当前轮（流式/工具执行停止），
+    新输入立即作为下一轮问题；被中断轮的不完整消息不回填对话历史。
+    """
     history = None  # 当前会话的完整消息列表（None = 新会话）
+    pending_input = None  # 打断时读到的新输入，作为下一轮问题
     while True:
-        try:
-            user_input = _ask("你 > ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n👋 再见")
-            break
+        if pending_input is None:
+            try:
+                user_input = _ask("你 > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n👋 再见")
+                break
+        else:
+            user_input = pending_input
+            pending_input = None
 
         if not user_input:
             continue
@@ -193,17 +218,50 @@ def interactive(agent: AIAgent) -> None:
         # stream_callback 让最终回答逐段打印（打字机效果），
         # 失败路径不走流式（重试耗尽，无响应可流）
         print("🤖 ", end="", flush=True)
-        result = agent.run_conversation(
-            user_input,
-            conversation_history=history,
-            stream_callback=_stream_print,
-        )
+        before_history = history
+        result_holder: dict = {}
+        interrupted = {"flag": False}
+
+        def _run():
+            result_holder["result"] = agent.run_conversation(
+                user_input,
+                conversation_history=before_history,
+                stream_callback=_stream_print,
+            )
+
+        worker = threading.Thread(target=_run, daemon=True, name="cli-conversation")
+        worker.start()
+        # 主线程监听键盘：有新输入或 Ctrl+C → 请求优雅中断当前轮
+        while worker.is_alive():
+            try:
+                if select.select([sys.stdin], [], [], 0.2)[0]:
+                    text = _read_stdin_available()
+                    if text:
+                        agent.request_interrupt()
+                        interrupted["flag"] = True
+                        pending_input = text
+                        break
+            except KeyboardInterrupt:
+                # Ctrl+C：第一次请求优雅中断，不退出（输入阶段仍由 _ask 处理退出）
+                agent.request_interrupt()
+                interrupted["flag"] = True
+                break
+            except (OSError, ValueError):
+                # 平台不支持 stdin select（如 Windows）→ 退化为纯 Ctrl+C 打断
+                pass
+        worker.join()
         print()  # 流式输出结束后换行
 
-        if result["failed"]:
+        result = result_holder.get("result")
+        if interrupted["flag"]:
+            # 被中断轮的不完整消息不回填历史，避免污染下一轮上下文
+            history = before_history
+            print("⚡ 已中断当前回复。")
+        elif result and result.get("failed"):
             print(f"❌ {result['final_response']}")
-
-        history = result["messages"]
+            history = result.get("messages") or history
+        else:
+            history = (result or {}).get("messages") or history
 
 
 def once(agent: AIAgent, query: str) -> None:
