@@ -152,11 +152,14 @@ def _assemble_stream_response(
     content_parts: list,
     tool_calls_acc: list,
     finish_reason: Optional[str],
+    usage=None,
 ) -> Any:
     """把流式 chunk 聚合的文本/工具调用组装成响应对象。
 
     返回 SimpleNamespace，形状与非流式 ``response.choices[0].message`` 一致
-    （content / tool_calls / finish_reason），主循环后续逻辑无需区分来源。
+    （content / tool_calls / finish_reason / usage），主循环后续逻辑无需区分来源。
+    usage 来自流式末段 chunk（``stream_options={"include_usage": true}`` 时
+    provider 会附带）；拿不到时为 None（调用方按无 usage 处理）。
     """
     from types import SimpleNamespace
 
@@ -183,7 +186,8 @@ def _assemble_stream_response(
         tool_calls=tool_calls,
     )
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+        usage=usage,
     )
 
 
@@ -235,12 +239,34 @@ def interruptible_streaming_api_call(
             with client_lock:
                 client_holder["client"] = client
 
-            stream = client.chat.completions.create(**api_kwargs, stream=True)
+            # 请求流式 usage（OpenAI 协议：stream_options.include_usage 让末段
+            # chunk 携带 usage，否则流式响应永远没有用量，状态栏 ctx 恒为 0）。
+            # 部分 provider 拒绝该参数（400）→ 回退不带，此时拿不到用量，
+            # 上层按无 usage 处理（状态栏显示 "ctx --"）。
+            def _open_stream():
+                kwargs = dict(api_kwargs)
+                wants_usage = "stream_options" not in kwargs
+                if wants_usage:
+                    kwargs["stream_options"] = {"include_usage": True}
+                try:
+                    # 仅主动请求 include_usage 时才收集 chunk.usage；调用方
+                    # 显式传入 stream_options 时原样保留、不干预其语义
+                    return client.chat.completions.create(**kwargs, stream=True), wants_usage
+                except Exception as exc:
+                    if wants_usage and getattr(exc, "status_code", None) == 400:
+                        return (
+                            client.chat.completions.create(**api_kwargs, stream=True),
+                            False,
+                        )
+                    raise
+
+            stream, collect_usage = _open_stream()
 
             # 聚合缓冲
             content_parts: list = []
             tool_calls_acc: list = []  # [{id, function: {name, arguments}}]，按 index 对齐
             finish_reason = None
+            usage = None
             first_delta_fired = {"done": False}
 
             def _fire_first() -> None:
@@ -259,6 +285,11 @@ def interruptible_streaming_api_call(
                     except Exception:
                         pass
                     break
+                if collect_usage:
+                    # include_usage 时末段 chunk 携带 usage；取最后一个非空值
+                    _chunk_usage = getattr(chunk, "usage", None)
+                    if _chunk_usage is not None:
+                        usage = _chunk_usage
                 if not getattr(chunk, "choices", None):
                     continue
                 choice = chunk.choices[0]
@@ -298,7 +329,7 @@ def interruptible_streaming_api_call(
                                 slot["function"]["arguments"] += fn.arguments
 
             result["response"] = _assemble_stream_response(
-                content_parts, tool_calls_acc, finish_reason
+                content_parts, tool_calls_acc, finish_reason, usage=usage
             )
         except Exception as exc:
             result["error"] = exc
