@@ -18,7 +18,10 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+from agent.model_metadata import (
+    MINIMUM_CONTEXT_LENGTH,
+    get_default_context_length,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -289,8 +292,8 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = summary_target_ratio
 
-        # 上下文长度：显式配置 > 默认 200000
-        self._config_context_length = _safe_int(config_context_length) or 200000
+        # 上下文长度：显式配置 > 硬编码表 > 默认 256K（对齐原版 0/8/9）
+        self._config_context_length = _safe_int(config_context_length) or 0
         self.context_length = self._resolve_context_length()
 
         # 阈值 tokens（含 max_tokens 输出预留；cap 限制）
@@ -341,8 +344,10 @@ class ContextCompressor(ContextEngine):
     # -- 上下文长度 / 阈值 ------------------------------------------------
 
     def _resolve_context_length(self) -> int:
-        """上下文长度：显式配置 > 默认。my-hermes 无 model_metadata 表。"""
-        return self._config_context_length
+        """上下文长度：显式配置 > 硬编码表 > 默认 256K（对齐原版 0/8/9）。"""
+        if self._config_context_length:
+            return self._config_context_length
+        return get_default_context_length(self.model, self.base_url)
 
     @property
     def context_length(self) -> int:
