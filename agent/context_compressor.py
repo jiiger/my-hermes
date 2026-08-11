@@ -77,6 +77,10 @@ def _redact_compaction_text(text: Any) -> str:
     for pattern in _SECRET_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
     # URL userinfo：https://user:pass@host → https://[REDACTED]@host
+    # 先短路：无 "://" 直接返回。否则 `[a-z][a-z0-9+.\-]*` 会在长无空格
+    # 文本（base64/哈希等）每个位置无界展开找 `://`，O(n²) 灾难性回溯。
+    if "://" not in redacted:
+        return redacted
     redacted = re.sub(
         r"([a-z][a-z0-9+.\-]*://)([^/@\s]+)@",
         r"\1[REDACTED]@",
