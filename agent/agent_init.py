@@ -1,4 +1,5 @@
 import logging
+import threading
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
@@ -172,11 +173,42 @@ def init_agent(
     agent.status_callback = status_callback  # 状态变更回调
 
     # ══════════════════════════════════════════════════════════════
-    # ⑤ 运行期状态（原版 agent_init.py:779-784）
+    # ⑤ 运行期状态（原版 agent_init.py:811-852）
     # ══════════════════════════════════════════════════════════════
-    agent._interrupt_requested = (
-        False  # 中断标志：request_interrupt() 置位，主循环检查到即退出
-    )
+
+    # 中断机制：用于跳出工具循环
+    agent._interrupt_requested = False
+    agent._interrupt_message = None  # 触发中断的可选消息
+    # 显式硬取消与重定向/消息状态分离。线程安全的 Event 让"原因"对
+    # 辅助流轮询器保持原子可见。
+    agent._hard_interrupt_requested = threading.Event()
+    agent._execution_thread_id = None  # run_conversation() 开始时设置
+    agent._interrupt_thread_signal_pending = False
+    agent._client_lock = threading.RLock()
+    agent._model_request_active = threading.Event()
+    agent._supports_active_turn_redirect = True
+
+    # /steer 机制——不打断 agent，把用户备注注入下一条工具结果
+    agent._pending_steer = None
+    agent._pending_steer_lock = threading.Lock()
+
+    # 活跃轮次重定向机制：普通跟进消息与硬 /stop 不同，保留有效轮次前缀、
+    # 只取消在途模型请求、用更正内容重建轮次尾部
+    agent._pending_redirect = None
+    agent._pending_redirect_lock = threading.Lock()
+
+    # 并发工具 worker 线程追踪：_execute_tool_calls_concurrent 让每个工具
+    # 跑在各自的 ThreadPoolExecutor worker 上，其 tid 与
+    # _execution_thread_id 不同，因此只对 _execution_thread_id 发
+    # _set_interrupt(True, ...) 不会让 worker 内的 is_interrupted() 生效；
+    # 这里记录 worker，interrupt() / clear_interrupt() 可显式扩散到它们的 tid。
+    agent._tool_worker_threads = set()
+    agent._tool_worker_threads_lock = threading.Lock()
+
+    # 子 agent 委派状态
+    agent._delegate_depth = 0  # 0 = 顶层 agent，子 agent 递增
+    agent._active_children = []  # 运行中的子 AIAgent（用于中断传播）
+    agent._active_children_lock = threading.Lock()
 
     # ══════════════════════════════════════════════════════════════
     # ⑥ provider 配置（原版 agent_init.py:828-846）

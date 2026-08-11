@@ -4,11 +4,13 @@
 session DB、上下文压缩预检、插件钩子、记忆提醒等，只保留核心组装。
 """
 
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.iteration_budget import IterationBudget
+from tools.interrupt import set_interrupt
 
 
 @dataclass
@@ -115,6 +117,18 @@ def build_turn_context(
     # 同一个 agent 连续多轮对话时，每轮都拿到满额预算，互不蚕食；
     # 原版同样以「换新对象」而非 reset() 实现轮次间预算重置。
     agent.iteration_budget = IterationBudget(agent.max_iterations)
+
+    # 记录执行线程，让 interrupt()/clear_interrupt() 能把工具级中断信号
+    # 精确限定到本 agent 的线程（对应原版 turn_context.py:1237-1245）。
+    agent._execution_thread_id = threading.current_thread().ident
+
+    # 清除陈旧的按线程中断状态，同时保留一个待处理的中断。
+    set_interrupt(False, agent._execution_thread_id)
+    if agent._interrupt_requested:
+        set_interrupt(True, agent._execution_thread_id)
+        agent._interrupt_thread_signal_pending = False
+    else:
+        agent._interrupt_message = None
 
     return TurnContext(
         user_message=user_message,

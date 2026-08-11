@@ -25,6 +25,8 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
+from agent.interrupt_compat import request_hard_interrupt
+
 # 保证从任意目录运行都能 import 项目模块（项目根目录；editable 安装的
 # finder 不覆盖新增的 tools/ 包，故显式把项目根加进 sys.path）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -188,8 +190,9 @@ def interactive(agent: AIAgent) -> None:
     """交互模式：多轮对话，自动把上一轮 messages 传给下一轮。
 
     对话在后台线程执行、主线程监听键盘（对齐原版"输入线程调
-    interrupt"的模式）：输入新内容或按 Ctrl+C 会调用
-    ``agent.request_interrupt()`` 优雅中断当前轮（流式/工具执行停止），
+    interrupt"的模式）：输入新内容会调用 ``agent.interrupt(text)``，
+    按 Ctrl+C 会调用 ``request_hard_interrupt(agent)`` 硬中断当前轮
+    （流式/工具执行停止），
     新输入立即作为下一轮问题；被中断轮的不完整消息不回填对话历史。
     """
     history = None  # 当前会话的完整消息列表（None = 新会话）
@@ -237,13 +240,16 @@ def interactive(agent: AIAgent) -> None:
                 if select.select([sys.stdin], [], [], 0.2)[0]:
                     text = _read_stdin_available()
                     if text:
-                        agent.request_interrupt()
+                        # 对齐原版 cli.py:14329：新输入打断时把消息传给
+                        # interrupt()，agent 侧记录 _interrupt_message
+                        agent.interrupt(text)
                         interrupted["flag"] = True
                         pending_input = text
                         break
             except KeyboardInterrupt:
-                # Ctrl+C：第一次请求优雅中断，不退出（输入阶段仍由 _ask 处理退出）
-                agent.request_interrupt()
+                # Ctrl+C：第一次请求硬中断，不退出（对齐原版 cli.py:16137；
+                # 输入阶段仍由 _ask 处理退出）
+                request_hard_interrupt(agent)
                 interrupted["flag"] = True
                 break
             except (OSError, ValueError):

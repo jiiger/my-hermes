@@ -1,14 +1,17 @@
 import logging
 import os
+import threading
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from agent import relay_runtime
+from agent.interrupt_compat import request_hard_interrupt
 from agent.iteration_budget import IterationBudget
 from agent.process_bootstrap import OpenAI, _get_proxy_for_base_url
 
 # 经 run_agent 命名空间暴露给 agent.system_prompt._ra()（测试 patch 契约）
 from agent.prompt_builder import build_environment_hints
+from tools.interrupt import set_interrupt as _set_interrupt
 from utils import base_url_hostname
 
 logger = logging.getLogger(__name__)
@@ -310,29 +313,191 @@ class AIAgent:
         """
         self._current_streamed_assistant_text = ""
 
-    def request_interrupt(self) -> None:
-        """请求中断当前轮次：置位 _interrupt_requested。
+    def interrupt(self, message: Optional[str] = None, *, hard_cancel: bool = False) -> None:
+        """请求中断当前工具循环（对齐原版 run_agent.py:3091）。
 
-        主循环在每个迭代开头检查该标志（对应原版 run_agent.py 的中断机制），
-        检查到即停止本轮对话。中断是协作式的：正在执行的工具调用不会被强杀。
+        从另一个线程调用（如输入处理器、消息接收方），优雅地停止 agent
+        并处理新消息；同时向正在执行的长时间工具（如终端命令）发送提前
+        终止信号，让 agent 能立即响应。
+
+        Args:
+            message: 触发中断的可选新消息。提供时，agent 会把它纳入响应上下文。
+            hard_cancel: 标记为显式停止（而非重定向或新消息打断）。压缩
+                         机制会在普通中断被屏蔽时也尊重这个原子信号。
+
+        Example (CLI):
+            # 在独立的输入线程中：
+            if user_typed_something:
+                agent.interrupt(user_input)
         """
-        self._interrupt_requested = True
+        # 硬停止与重定向共用一把锁，避免 /stop 与已接受的更正消息竞争，
+        # 防止意外把自身变成重试。
+        def _admit_hard_cancel() -> None:
+            event = getattr(self, "_hard_interrupt_requested", None)
+            if event is None:
+                return
+            fence = vars(self).get("_active_compression_commit_fence")
+            cancel_before_commit = getattr(
+                type(fence), "cancel_before_commit", None
+            )
+            if callable(cancel_before_commit):
+                try:
+                    # 持与 begin_commit() 相同的锁置位 Event；若提交已获胜，
+                    # 先等被追踪的变更完成再发布停止信号。
+                    cancel_before_commit(fence, event)
+                    return
+                except Exception:
+                    logger.debug(
+                        "Compression hard-cancel fence admission failed",
+                        exc_info=True,
+                    )
+            event.set()
+
+        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        if _redirect_lock is not None:
+            with _redirect_lock:
+                self._interrupt_requested = True
+                self._interrupt_message = message
+                if hard_cancel:
+                    _admit_hard_cancel()
+                self._pending_redirect = None
+        else:
+            self._interrupt_requested = True
+            self._interrupt_message = message
+            if hard_cancel:
+                _admit_hard_cancel()
+            self._pending_redirect = None
+
+        # Codex app-server 拥有自己的模型/工具循环，监听私有中断事件而
+        # 非 Hermes 的按线程标志。
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            _codex_session = getattr(self, "_codex_session", None)
+            _request_interrupt = getattr(_codex_session, "request_interrupt", None)
+            if callable(_request_interrupt):
+                try:
+                    _request_interrupt()
+                except Exception:
+                    logger.debug(
+                        "Failed to interrupt Codex app-server turn",
+                        exc_info=True,
+                    )
+
+        # cron 轮次在对话线程上执行 API 请求，以避免嵌套中断 worker 死锁；
+        # 与普通 worker 路径不同，它的客户端在这里注册，跨线程中断仍能
+        # 及时关掉活跃 socket。
+        _abort_active_request = getattr(self, "_active_request_abort", None)
+        if callable(_abort_active_request):
+            try:
+                _abort_active_request("interrupt_abort")
+            except Exception:
+                logger.debug("Failed to abort active inline request", exc_info=True)
+        # 向所有工具发送立即中止在途操作的信号。范围限定在本 agent 的执行
+        # 线程，同一进程内的其他 agent（网关）不受影响。
+        if self._execution_thread_id is not None:
+            _set_interrupt(True, self._execution_thread_id)
+            self._interrupt_thread_signal_pending = False
+        else:
+            # 中断在 run_conversation() 把 agent 绑定到执行线程之前到达；
+            # 延后工具级中断信号到启动完成，而不是误伤调用方线程。
+            self._interrupt_thread_signal_pending = True
+        # 扩散到并发工具 worker 线程。这些 worker 跑在各自 tid 上
+        # （ThreadPoolExecutor worker），因此工具内 is_interrupted() 只有
+        # 在 _interrupted_threads 集合含其 tid 时才可见中断；没有这里的
+        # 扩散，已运行的并发工具（如挂在网络 I/O 上的终端命令）将感知不到
+        # 中断，只能跑到自身超时。
+        _tracker = getattr(self, "_tool_worker_threads", None)
+        _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
+        if _tracker is not None and _tracker_lock is not None:
+            with _tracker_lock:
+                _worker_tids = list(_tracker)
+            for _wtid in _worker_tids:
+                try:
+                    _set_interrupt(True, _wtid)
+                except Exception:
+                    pass
+        # 传播到运行中的子 agent（子 agent 委派）
+        with self._active_children_lock:
+            children_copy = list(self._active_children)
+        for child in children_copy:
+            try:
+                if hard_cancel:
+                    request_hard_interrupt(child, message)
+                else:
+                    child.interrupt(message)
+            except Exception as e:
+                logger.debug("Failed to propagate interrupt to child agent: %s", e)
+        if not self.quiet_mode:
+            print(
+                "\n⚡ Interrupt requested"
+                + (
+                    f": '{message[:40]}...'"
+                    if message and len(message) > 40
+                    else f": '{message}'" if message else ""
+                )
+            )
+
+    def hard_interrupt(self, message: Optional[str] = None) -> None:
+        """请求显式停止，同时保留 ``interrupt()`` 的 ABI（对齐原版 :3226）。
+
+        前端可特性检测本方法，对合成/第三方 agent 回退到旧版
+        ``interrupt()`` 签名。
+        """
+        # 有意绕过动态分发：按旧版 interrupt(message=None) ABI 写的子类
+        # 可能覆写了不带新关键字 hard_cancel 的 interrupt。
+        AIAgent.interrupt(self, message, hard_cancel=True)
+
+    @property
+    def is_interrupted(self) -> bool:
+        """检查是否已请求中断（对齐原版 :4547）。"""
+        return self._interrupt_requested
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
-        """消费中断请求，让下一轮对话不受旧中断影响。
+        """清除中断请求与按线程工具信号（对齐原版 run_agent.py:3237）。
 
-        返回值语义对齐原版 run_agent.py:3237：``preserve_redirect=True``
-        且当前没有可保留的 ``_pending_redirect`` 时返回 False（表示没有
-        可保留的重定向，调用方应中止重建），否则清中断并返回 True。
-        ``preserve_redirect`` 由对话循环在主动取消模型请求、重建同一逻辑
-        轮次时使用；my-hermes 精简版无 _interrupt_message /
-        _hard_interrupt_requested 状态，只清软中断标志与 pending redirect。
+        ``preserve_redirect`` 仅由对话循环在主动取消模型请求、重建同一
+        逻辑轮次时使用；公共硬停止路径保持默认，清除一切。
         """
-        if preserve_redirect and not getattr(self, "_pending_redirect", None):
-            return False
-        self._interrupt_requested = False
-        if not preserve_redirect:
-            self._pending_redirect = None
+        _redirect_lock = getattr(self, "_pending_redirect_lock", None)
+        if _redirect_lock is not None:
+            with _redirect_lock:
+                if preserve_redirect and not self._pending_redirect:
+                    return False
+                self._interrupt_requested = False
+                self._interrupt_message = None
+                getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
+                if not preserve_redirect:
+                    self._pending_redirect = None
+        else:
+            if preserve_redirect and not getattr(self, "_pending_redirect", None):
+                return False
+            self._interrupt_requested = False
+            self._interrupt_message = None
+            getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
+            if not preserve_redirect:
+                self._pending_redirect = None
+        self._interrupt_thread_signal_pending = False
+        if self._execution_thread_id is not None:
+            _set_interrupt(False, self._execution_thread_id)
+        # 同时清除并发工具 worker 线程位。被追踪的 worker 通常在退出时清
+        # 自己的位，但这里显式清除可保证轮次边界上不会有陈旧中断残存，
+        # 防止后续不相关的工具调用恰好调度到同一复用 worker tid 时被误触发。
+        _tracker = getattr(self, "_tool_worker_threads", None)
+        _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
+        if _tracker is not None and _tracker_lock is not None:
+            with _tracker_lock:
+                _worker_tids = list(_tracker)
+            for _wtid in _worker_tids:
+                try:
+                    _set_interrupt(False, _wtid)
+                except Exception:
+                    pass
+        # 硬中断优先于任何待处理的 /steer——steer 本意是给 agent 的下一次
+        # 工具迭代注入，而那次迭代不会再发生。丢弃它，避免中断后轮次上
+        # 出现迟到的注入。
+        _steer_lock = getattr(self, "_pending_steer_lock", None)
+        if _steer_lock is not None:
+            with _steer_lock:
+                self._pending_steer = None
         return True
 
     def _execute_tool_calls(
