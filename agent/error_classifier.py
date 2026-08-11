@@ -192,7 +192,12 @@ def classify_api_error(
             # 模型不存在：换模型/回退
             return ClassifiedError(reason=FailoverReason.model_not_found, status_code=status_code, message=str(error), retryable=False)
         if status_code == 413:
-            return ClassifiedError(reason=FailoverReason.payload_too_large, status_code=status_code, message=str(error))
+            return ClassifiedError(
+                reason=FailoverReason.payload_too_large,
+                status_code=status_code,
+                message=str(error),
+                should_compress=True,
+            )
         if status_code in (500, 502):
             return ClassifiedError(reason=FailoverReason.server_error, status_code=status_code, message=str(error))
         if status_code in (503, 529):
@@ -200,7 +205,12 @@ def classify_api_error(
         if status_code == 400:
             # 400 最模糊：按消息细分
             if _contains_any(msg, _CONTEXT_PATTERNS):
-                return ClassifiedError(reason=FailoverReason.context_overflow, status_code=status_code, message=str(error))
+                return ClassifiedError(
+                    reason=FailoverReason.context_overflow,
+                    status_code=status_code,
+                    message=str(error),
+                    should_compress=True,
+                )
             if _contains_any(msg, _POLICY_PATTERNS):
                 return ClassifiedError(
                     reason=FailoverReason.content_policy_blocked, status_code=status_code, message=str(error), retryable=False
@@ -225,7 +235,12 @@ def classify_api_error(
     if _contains_any(msg, _BILLING_PATTERNS):
         return ClassifiedError(reason=FailoverReason.billing, status_code=None, message=str(error), retryable=False)
     if _contains_any(msg, _CONTEXT_PATTERNS):
-        return ClassifiedError(reason=FailoverReason.context_overflow, status_code=None, message=str(error))
+        return ClassifiedError(
+            reason=FailoverReason.context_overflow,
+            status_code=None,
+            message=str(error),
+            should_compress=True,
+        )
     if _contains_any(msg, _POLICY_PATTERNS):
         return ClassifiedError(
             reason=FailoverReason.content_policy_blocked, status_code=None, message=str(error), retryable=False

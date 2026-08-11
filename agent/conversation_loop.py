@@ -10,6 +10,7 @@
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.error_classifier import classify_api_error
 from agent.process_bootstrap import _install_safe_stdio
 from agent.turn_context import build_turn_context
 
@@ -90,10 +91,11 @@ def run_conversation(
     # ── 序言（每回合一次性设置）──
 
     # 压缩状态复位：上一轮若发生过就地压缩，其状态标记不能带到本轮。
-    # 精简版暂无压缩功能，先保留占位（对应原版 1290-1292 行）
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    # 错误触发压缩的次数（turn 级，跨外层迭代累计，对应原版 :1579）
+    compression_attempts = 0
 
     # MoA（多模型聚合）已裁剪：原版在此解码 moa_config。
     # env 凭据刷新已裁剪：原版在此调用 agent._try_refresh_env_client_credentials()。
@@ -165,6 +167,24 @@ def run_conversation(
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
 
+        # ①½ 主动压缩检查：上一轮 API 响应后已 update_from_response，
+        #    这里用真实用量判定是否超阈值；命中则压缩消息历史后重新组装。
+        _compressor = getattr(agent, "context_compressor", None)
+        if _compressor is not None and _compressor.should_compress():
+            if not agent._interrupt_requested:
+                _new_messages = _compressor.compress(messages)
+                if len(_new_messages) < len(messages):
+                    messages = _new_messages
+                    # 压缩保护 tail（含最近 user 消息）；若下标越界则重置
+                    # 到最后一条 user 消息（保守，避免指向被压缩掉的中间轮）
+                    if current_turn_user_idx >= len(messages):
+                        for _i in range(len(messages) - 1, -1, -1):
+                            if messages[_i].get("role") == "user":
+                                current_turn_user_idx = _i
+                                break
+                        else:
+                            current_turn_user_idx = max(0, len(messages) - 1)
+
         # ② 计数 + 预算消耗：正常轮次消耗一次迭代预算；
         #    _budget_grace_call（宽限调用）不占预算，用一次就清掉
         api_call_count += 1
@@ -223,7 +243,6 @@ def run_conversation(
             )
         if effective_system:
             # 注意：是 [system] + api_messages 拼接，不是覆盖！
-            # （原版 1713 行；这里修复了历史消息被丢弃的问题）
             api_messages = [
                 {"role": "system", "content": effective_system}
             ] + api_messages
@@ -248,6 +267,10 @@ def run_conversation(
         response = None
         api_request_id = f"{turn_id}:api:{api_call_count}"  # 每次调用一个请求ID
         agent._current_api_request_id = api_request_id
+        # 错误触发压缩的次数上限（对应原版 max_compression_attempts，缺省 3）
+        # 与"压缩后回退外层循环重试"标志（对齐原版 _retry.restart_with_compressed_messages）
+        _max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
+        _restart_with_compressed_messages = False
 
         # ⑧ 内层循环：真正的 API 调用 + 失败重试（可中断 + 中间件 + 回退）。
         #    有流式消费者（stream_callback）→ 走流式，逐增量触发回调；
@@ -273,6 +296,20 @@ def run_conversation(
                 # 直接发起 API 调用（原版经 LLM 执行中间件链；my-hermes
                 # 无插件系统、无任何注册方，中间件已砍掉）
                 response = _perform_api_call(api_kwargs)
+                # 成功后记录真实用量：主动压缩判定依赖它
+                _usage = getattr(response, "usage", None)
+                if _usage is not None and _compressor is not None:
+                    # OpenAI SDK 的 usage 是对象（CompletionUsage），
+                    # 归一化为 dict 再交给压缩机（对齐原版做法）
+                    if not hasattr(_usage, "get"):
+                        _usage = {
+                            "prompt_tokens": getattr(_usage, "prompt_tokens", 0),
+                            "completion_tokens": getattr(
+                                _usage, "completion_tokens", 0
+                            ),
+                            "total_tokens": getattr(_usage, "total_tokens", None),
+                        }
+                    _compressor.update_from_response(_usage)
                 break  # 成功拿到响应，退出重试循环
             except InterruptedError:
                 # 用户中断：不重试，整轮退出（与循环顶部的中断检查殊途同归）
@@ -280,6 +317,35 @@ def run_conversation(
                 _turn_exit_reason = "interrupted_by_user"
                 break
             except Exception as exc:
+                # 错误触发压缩：上下文溢出类错误（context_overflow /
+                # payload_too_large）标记 should_compress=True，压缩历史后
+                # 设置标志并跳出内层循环，由外层退款 + 重新组装重试
+                # （对齐原版 restart_with_compressed_messages 语义）
+                if (
+                    _compressor is not None
+                    and compression_attempts < _max_compression_attempts
+                ):
+                    _classified = classify_api_error(
+                        exc,
+                        provider=getattr(agent, "provider", "") or "",
+                        model=getattr(agent, "model", "") or "",
+                        approx_tokens=getattr(_compressor, "last_prompt_tokens", 0)
+                        or 0,
+                        context_length=getattr(_compressor, "context_length", 0) or 0,
+                        num_messages=len(messages) if messages else 0,
+                    )
+                    if _classified.should_compress:
+                        compression_attempts += 1
+                        _new_messages = _compressor.compress(messages)
+                        if len(_new_messages) < len(messages):
+                            messages = _new_messages
+                            _restart_with_compressed_messages = True
+                            if not getattr(agent, "quiet_mode", False):
+                                agent._safe_print(
+                                    f"🧹 上下文超限，已压缩历史并重试 "
+                                    f"（第 {compression_attempts}/{_max_compression_attempts} 次）"
+                                )
+                            break
                 retry_count += 1
                 if retry_count >= max_retries:
                     # 重试耗尽：本轮标记失败，错误信息作为最终回复返回。
@@ -295,6 +361,23 @@ def run_conversation(
                         f"⚠️ API 调用失败（第 {retry_count}/{max_retries} 次）: "
                         f"{exc}，准备重试..."
                     )
+
+        # ⑧½ 错误触发压缩后的重试：压缩已更新 messages，退款本次调用
+        #    （计数 + 预算），重新锚定当前用户消息下标，回退外层循环重新
+        #    组装请求再调 API（对齐原版 :6002-6032）
+        if _restart_with_compressed_messages:
+            _restart_with_compressed_messages = False
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            agent.iteration_budget.refund()
+            if current_turn_user_idx >= len(messages):
+                for _i in range(len(messages) - 1, -1, -1):
+                    if messages[_i].get("role") == "user":
+                        current_turn_user_idx = _i
+                        break
+                else:
+                    current_turn_user_idx = max(0, len(messages) - 1)
+            continue
 
         if failed or interrupted:
             break

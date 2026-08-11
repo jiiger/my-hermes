@@ -207,3 +207,8 @@ my_hermes.egg-info
 
 # Test files are local-only (user decision)
 tests/
+
+# 覆盖率数据（pytest-cov 构建产物）
+.coverage
+.coverage.*
+htmlcov/

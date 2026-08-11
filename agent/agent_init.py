@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import uuid
 from datetime import datetime
@@ -8,6 +9,16 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 from agent.iteration_budget import IterationBudget
 
 logger = logging.getLogger("run_agent")
+
+
+def _safe_int_comp(value: Any) -> int | None:
+    """把配置值安全转 int，失败返回 None（压缩挂载用）。"""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def init_agent(
@@ -225,6 +236,28 @@ def init_agent(
         openrouter_min_coding_score  # OpenRouter 最低编码分
     )
     agent.max_tokens = max_tokens  # 单次响应最大 token 数（None = 模型默认）
+    # 未显式指定时从 config model.max_tokens 兜底（对齐原版 agent_init.py:2142）
+    if agent.max_tokens is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _model_cfg = (load_config_readonly().get("model", None) or {})
+            if isinstance(_model_cfg, dict):
+                _cfg_max_tokens = _model_cfg.get("max_tokens")
+                if _cfg_max_tokens is not None:
+                    try:
+                        if not isinstance(_cfg_max_tokens, bool):
+                            _parsed_max = int(_cfg_max_tokens)
+                            if _parsed_max > 0:
+                                agent.max_tokens = _parsed_max
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Invalid model.max_tokens in config.yaml: %r — "
+                            "must be a positive integer. Using provider default.",
+                            _cfg_max_tokens,
+                        )
+        except Exception:
+            pass
     agent.reasoning_config = reasoning_config  # 推理配置（effort 等）
     agent.service_tier = service_tier  # 服务等级
     agent.request_overrides = dict(
@@ -396,7 +429,32 @@ def init_agent(
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries  # API 调用失败的最大重试次数
-    agent._api_stale_timeout = 180.0  # API 调用无响应判定超时（防永久挂起）
+    # API 调用无响应判定超时（防永久挂起）：优先从 config
+    # providers.<provider>.stale_timeout_seconds 读取（对齐原版
+    # hermes_cli/timeouts.py:get_provider_stale_timeout），缺省 180s
+    agent._api_stale_timeout = 180.0
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _cfg_all = load_config_readonly()
+        _providers_cfg = (
+            _cfg_all.get("providers", {}) if isinstance(_cfg_all, dict) else {}
+        )
+        if isinstance(_providers_cfg, dict):
+            _pcfg = _providers_cfg.get(agent.provider or "", {})
+            if isinstance(_pcfg, dict):
+                _cfg_stale = _pcfg.get("stale_timeout_seconds")
+                if _cfg_stale is not None:
+                    try:
+                        agent._api_stale_timeout = float(_cfg_stale)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Invalid providers.%s.stale_timeout_seconds: %r",
+                            agent.provider,
+                            _cfg_stale,
+                        )
+    except Exception:
+        pass
 
     # ══════════════════════════════════════════════════════════════
     # ⑭ 回退运行期状态（原版 agent_init.py:2789 的 _primary_runtime 在函数末尾）
@@ -406,5 +464,83 @@ def init_agent(
     agent._rate_limited_until = (
         0.0  # 限流冷却截止（monotonic），冷却期不恢复主 provider
     )
+
+    # ══════════════════════════════════════════════════════════════
+    # ⑮ 上下文压缩引擎挂载（config.yaml compression 段）
+    # ══════════════════════════════════════════════════════════════
+    # enabled=true 时创建 ContextCompressor 挂到 agent.context_compressor；
+    # 方案 B：可配置独立摘要模型（summary_model/summary_base_url/
+    # summary_api_key_env），缺省回退主模型与主 agent worker client。
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _comp_cfg = (load_config_readonly().get("compression", None) or {})
+        _model_section = (load_config_readonly().get("model", None) or {})
+    except Exception:
+        _comp_cfg = {}
+        _model_section = {}
+    if _comp_cfg.get("enabled", False):
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            # 错误触发压缩的重试次数上限（conversation_loop 读取）
+            agent.max_compression_attempts = max(
+                1, int(_comp_cfg.get("max_attempts", 3) or 3)
+            )
+            _summary_model = str(_comp_cfg.get("summary_model") or "").strip() or None
+            _summary_base_url = str(_comp_cfg.get("summary_base_url") or "").strip() or None
+            _summary_key_env = str(_comp_cfg.get("summary_api_key_env") or "").strip() or None
+            _summary_api_key = os.getenv(_summary_key_env) if _summary_key_env else ""
+            # 绝对 token 上限（compression.threshold_tokens）与按模型阈值覆盖
+            _threshold_tokens_cap = _safe_int_comp(_comp_cfg.get("threshold_tokens"))
+            _model_thresholds_cfg = _comp_cfg.get("model_thresholds") or {}
+            if not isinstance(_model_thresholds_cfg, dict):
+                _model_thresholds_cfg = {}
+
+            def _summary_client_factory():
+                """方案 B：独立摘要客户端工厂（配置了独立模型时）。"""
+                from agent.agent_runtime_helpers import create_openai_client
+
+                return create_openai_client(
+                    agent,
+                    {
+                        "api_key": _summary_api_key or agent.api_key or "",
+                        "base_url": _summary_base_url or agent.base_url or "",
+                    },
+                    reason="summary",
+                    shared=False,
+                )
+
+            agent.context_compressor = ContextCompressor(
+                model=agent.model or "",
+                threshold_percent=float(_comp_cfg.get("threshold", 0.5)),
+                protect_first_n=int(_comp_cfg.get("protect_first_n", 3)),
+                protect_last_n=int(_comp_cfg.get("protect_last_n", 20)),
+                summary_target_ratio=float(_comp_cfg.get("target_ratio", 0.2)),
+                quiet_mode=getattr(agent, "quiet_mode", False),
+                summary_model_override=_summary_model,
+                base_url=agent.base_url or "",
+                api_key=agent.api_key or "",
+                # 上下文长度来源：compression.context_length 优先，
+                # 其次 model.context_length（对齐原版 model 段键位），缺省 None
+                config_context_length=(
+                    _safe_int_comp(_comp_cfg.get("context_length"))
+                    or _safe_int_comp(_model_section.get("context_length"))
+                ),
+                provider=agent.provider or "",
+                api_mode=getattr(agent, "api_mode", "") or "",
+                abort_on_summary_failure=bool(_comp_cfg.get("abort_on_summary_failure", False)),
+                max_tokens=getattr(agent, "max_tokens", None),
+                threshold_tokens_cap=_threshold_tokens_cap,
+                model_thresholds=_model_thresholds_cfg,
+                min_tail_user_messages=int(_comp_cfg.get("min_tail_user_messages", 1)),
+                agent=agent,
+                summary_client_factory=_summary_client_factory if _summary_model else None,
+            )
+        except Exception as exc:  # 压缩挂载失败不阻断启动
+            logger.warning("Context compressor mount failed: %s", exc)
+            agent.context_compressor = None
+    else:
+        agent.context_compressor = None
 
     # TODO 。。。。。。
