@@ -559,6 +559,27 @@ def interactive(agent: AIAgent) -> None:
         if user_input.lower() in ("/quit", "/exit", "q", "quit", "exit"):
             break
         if user_input.lower() == "/new":
+            # 新会话：轮换 session_id 并通知外部记忆 provider
+            # （对齐原版 /new 语义：commit_session_boundary_async 保证
+            # on_session_end 先于 on_session_switch，串行执行）。
+            _mm = getattr(agent, "_memory_manager", None)
+            if _mm is not None:
+                from datetime import datetime
+                import uuid as _uuid
+
+                _old_sid = agent.session_id
+                agent.session_id = (
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+                )
+                try:
+                    _mm.commit_session_boundary_async(
+                        history or [],
+                        new_session_id=agent.session_id,
+                        parent_session_id=_old_sid or "",
+                        reason="new_session",
+                    )
+                except Exception:
+                    pass
             history = None
             print("（已开启新会话）\n")
             continue

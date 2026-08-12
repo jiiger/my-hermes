@@ -233,6 +233,20 @@ def run_conversation(
                 # 当前用户消息：若存在 api_context 且是有效字符串，覆盖 content
                 if isinstance(_api_content, str) and _api_content:
                     api_msg["content"] = _api_content
+                # 外部记忆 provider 召回结果围栏注入当前用户消息
+                # （对齐原版 turn_context.py:1294 _ext_prefetch_cache 注入）
+                if _ext_prefetch_cache:
+                    from agent.memory_manager import build_memory_context_block
+
+                    _mem_block = build_memory_context_block(_ext_prefetch_cache)
+                    if _mem_block:
+                        _cur = api_msg.get("content")
+                        if isinstance(_cur, str):
+                            api_msg["content"] = f"{_cur}\n\n{_mem_block}"
+                        elif isinstance(_cur, list):
+                            api_msg["content"] = _cur + [
+                                {"type": "text", "text": f"\n\n{_mem_block}"}
+                            ]
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -486,6 +500,28 @@ def run_conversation(
     # ══════════════════════════════════════════════════════════════
     # 收尾：组装结果 dict（对应原版 finalize_turn 的简化替代）
     # ══════════════════════════════════════════════════════════════
+    # 外部记忆 provider：回合完成 → sync_all（持久化对话）+ queue_prefetch_all
+    # （预热下一轮召回）。中断回合跳过（对齐原版
+    # run_agent._mirror_completed_turn_to_memory，#15218）。
+    _mm = getattr(agent, "_memory_manager", None)
+    if _mm and final_response and not interrupted and original_user_message:
+        try:
+            from agent.memory_provider import is_trivial_prompt
+
+            _user_text = str(original_user_message)
+            _mm.sync_all(
+                _user_text,
+                str(final_response),
+                session_id=agent.session_id or "",
+                messages=messages,
+            )
+            if not is_trivial_prompt(_user_text):
+                _mm.queue_prefetch_all(
+                    _user_text, session_id=agent.session_id or ""
+                )
+        except Exception:
+            pass  # 外部记忆是 best-effort，失败不阻断回合收尾
+
     # turn 结束时消费中断标志（对应原版 turn_finalizer.py:693 的
     # clear_interrupt()）。这样用户的一次中断只影响当前轮，不会
     # 污染下一轮对话。

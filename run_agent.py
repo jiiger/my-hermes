@@ -908,6 +908,20 @@ class AIAgent:
 
         invalidate_system_prompt(self)
 
+    def close(self) -> None:
+        """关闭 agent，释放资源（对应原版 AIAgent.close 的记忆部分）。
+
+        my-hermes 无 SessionDB / 进程注册表 / 终端沙箱等，只关闭外部记忆
+        provider（MemoryManager.shutdown_all：有界排空 + 逆序关闭）。
+        幂等可重复调用。
+        """
+        _mm = getattr(self, "_memory_manager", None)
+        if _mm is not None:
+            try:
+                _mm.shutdown_all()
+            except Exception:
+                pass
+
 
 def main(
     query: str = None,

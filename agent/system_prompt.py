@@ -180,7 +180,15 @@ def build_system_prompt_parts(
             if user_block:
                 volatile_parts.append(user_block)
 
-    # 3 TODO 外部记忆提供方（my-hermes 无插件体系，_memory_manager 恒为 None）
+    # 3 外部记忆提供方（聚合 provider 的系统提示块，对齐原版
+    #    system_prompt.py:535-541；_memory_manager 为 None 时跳过）
+    if getattr(agent, "_memory_manager", None):
+        try:
+            _ext_mem_block = agent._memory_manager.build_system_prompt()
+            if _ext_mem_block:
+                volatile_parts.append(_ext_mem_block)
+        except Exception:
+            pass
 
     from hermes_time import now as _hermes_now
 

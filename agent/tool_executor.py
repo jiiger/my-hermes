@@ -136,6 +136,14 @@ def _run_tool(
                     operations=function_args.get("operations"),
                     store=getattr(agent, "_memory_store", None),
                 )
+                # 内置 memory 写入成功后镜像给外部记忆 provider
+                # （对齐原版 agent/tool_executor.py:1797）。
+                _mm = getattr(agent, "_memory_manager", None)
+                if _mm is not None:
+                    try:
+                        _mm.notify_memory_tool_write(result, function_args)
+                    except Exception:
+                        pass
             else:
                 result = impl(**function_args)
         except KeyboardInterrupt:

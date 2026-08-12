@@ -18,7 +18,7 @@ agent.*（避免循环依赖）。
 import copy
 import logging
 import threading
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -148,3 +148,39 @@ def load_config_readonly() -> Dict[str, Any]:
     （prompt 构建、超时读取等热路径）。
     """
     return _load_config_impl(want_deepcopy=False)
+
+
+def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
+    """安全遍历嵌套 dict 键，任何 miss 都返回 ``default``。
+
+    对应原版 hermes_cli/config.py:2886 cfg_get。统一处理三个常见坑：
+
+      1. 缺中间键（返回 default，无 KeyError）；
+      2. 中间值不是 dict（如用户把段写成了字符串）——返回 default，
+         而不是在 .get() 上 AttributeError；
+      3. cfg 为 None（调用方有时传 ``load_config() or None``）。
+
+    显式 None 值原样返回（与 ``dict.get(key, default)`` 语义一致——
+    default 只在键**缺失**时返回，键存在但值为 None 时返回 None）。
+
+    例子：:
+        >>> cfg_get({"agent": {"reasoning_effort": "high"}}, "agent", "reasoning_effort")
+        'high'
+        >>> cfg_get({}, "agent", "reasoning_effort", default="medium")
+        'medium'
+        >>> cfg_get({"agent": "oops_a_string"}, "agent", "reasoning_effort", default="low")
+        'low'
+        >>> cfg_get({"a": {"b": None}}, "a", "b", default="def")  # 显式 None 保留
+        >>> cfg_get({"a": {"b": False}}, "a", "b", default=True)  # 假值保留
+        False
+    """
+    if not isinstance(cfg, dict):
+        return default
+    node: Any = cfg
+    for key in keys:
+        if not isinstance(node, dict):
+            return default
+        if key not in node:
+            return default
+        node = node[key]
+    return node

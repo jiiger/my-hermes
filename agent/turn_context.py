@@ -104,6 +104,26 @@ def build_turn_context(
         restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = getattr(agent, "_cached_system_prompt", None)
 
+    # 外部记忆 provider：通知新回合 + 回合前召回（prefetch_all）。
+    # 跳过琐碎提示（问候/确认）——零信号文本不值得召回（对齐原版
+    # turn_context.py:1248-1270）。召回结果存入 ext_prefetch_cache，
+    # 由 conversation_loop 围栏注入当前用户消息。
+    ext_prefetch_cache = ""
+    if getattr(agent, "_memory_manager", None):
+        try:
+            agent._memory_manager.on_turn_start(0, str(user_message))
+        except Exception:
+            pass
+        from agent.memory_provider import is_trivial_prompt
+
+        if not is_trivial_prompt(str(user_message)):
+            try:
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                    str(user_message)
+                ) or ""
+            except Exception:
+                pass
+
     # 任务 / 轮次 ID：调用方没传任务ID就现场生成
     effective_task_id = task_id or str(uuid.uuid4())
     turn_id = str(uuid.uuid4())
@@ -147,5 +167,6 @@ def build_turn_context(
         effective_task_id=effective_task_id,
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
+        ext_prefetch_cache=ext_prefetch_cache,
     )
 

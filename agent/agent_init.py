@@ -392,7 +392,7 @@ def init_agent(
     )  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
     # 内置记忆（MEMORY.md + USER.md）——按原版 agent_init.py:1707-1725 精简。
     # 内置记忆是独立线，不经 MemoryManager（原版亦如此）；_memory_manager
-    # 仅用于外部 provider（my-hermes 暂无插件体系，恒为 None，占位保留）。
+    # 仅用于外部 provider，在 ⑫½（session 生成后）激活。
     agent._memory_store = None  # 记忆存储
     agent._memory_enabled = False  # 记忆开关
     agent._user_profile_enabled = False  # 用户画像（USER.md）开关
@@ -430,6 +430,52 @@ def init_agent(
         timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
+
+    # ══════════════════════════════════════════════════════════════
+    # ⑫½ 外部记忆 provider（MemoryManager）——按原版 agent_init.py:1727-1790
+    # 精简。读 config memory.provider → 插件加载器加载 → 注册进 MemoryManager
+    # → initialize_all；provider 工具合并进 agent.tools / _tool_impls。
+    # ══════════════════════════════════════════════════════════════
+    if not skip_memory:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _mem_cfg = (load_config_readonly().get("memory", None) or {})
+            _provider_name = str(_mem_cfg.get("provider", "") or "").strip()
+            if _provider_name:
+                from agent.memory_manager import MemoryManager
+                from hermes_constants import get_hermes_home
+                from plugins.memory import load_memory_provider
+
+                agent._memory_manager = MemoryManager()
+                _mp = load_memory_provider(_provider_name)
+                if _mp is not None and _mp.is_available():
+                    agent._memory_manager.add_provider(_mp)
+                if agent._memory_manager.providers:
+                    agent._memory_manager.initialize_all(
+                        session_id=agent.session_id,
+                        platform=platform or "cli",
+                        hermes_home=str(get_hermes_home()),
+                        agent_context="primary",
+                    )
+                    # provider 工具合并进工具面：schema 进 agent.tools、
+                    # 工具名进 valid_tool_names、handler 转发到 manager
+                    for _schema in agent._memory_manager.get_all_tool_schemas():
+                        _tname = _schema.get("name")
+                        if not _tname or _tname in agent.valid_tool_names:
+                            continue
+                        agent.tools.append({"type": "function", "function": _schema})
+                        agent.valid_tool_names.add(_tname)
+                        agent._tool_impls[_tname] = (
+                            lambda *a, _n=_tname, **kw: agent._memory_manager.handle_tool_call(
+                                _n, dict(kw)
+                            )
+                        )
+                else:
+                    agent._memory_manager = None
+        except Exception as _mpe:
+            logger.warning("Memory provider init failed: %s", _mpe)
+            agent._memory_manager = None
 
     # ══════════════════════════════════════════════════════════════
     # ⑬ 重试（原版 agent_init.py:1851）
