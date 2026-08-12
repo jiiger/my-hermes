@@ -168,8 +168,19 @@ def build_system_prompt_parts(
     # system message is one cache unit regardless of internal order.)
     # 1 TODO 技能提示词
 
-    # 2 TODO 内置记忆
-    # 3 TODO  外部记忆提供方
+    # 2 内置记忆（冻结快照注入，对应原版 system_prompt.py:523-535）
+    if getattr(agent, "_memory_store", None):
+        if agent._memory_enabled:
+            mem_block = agent._memory_store.format_for_system_prompt("memory")
+            if mem_block:
+                volatile_parts.append(mem_block)
+        # USER.md 启用时始终包含
+        if agent._user_profile_enabled:
+            user_block = agent._memory_store.format_for_system_prompt("user")
+            if user_block:
+                volatile_parts.append(user_block)
+
+    # 3 TODO 外部记忆提供方（my-hermes 无插件体系，_memory_manager 恒为 None）
 
     from hermes_time import now as _hermes_now
 

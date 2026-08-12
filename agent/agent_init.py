@@ -390,10 +390,30 @@ def init_agent(
     agent._tool_impls = (
         build_tool_impls_map()
     )  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
-    # TODO 这些属性被 system_prompt 的守卫读取，先占位 None，做记忆模块时激活
+    # 内置记忆（MEMORY.md + USER.md）——按原版 agent_init.py:1707-1725 精简。
+    # 内置记忆是独立线，不经 MemoryManager（原版亦如此）；_memory_manager
+    # 仅用于外部 provider（my-hermes 暂无插件体系，恒为 None，占位保留）。
     agent._memory_store = None  # 记忆存储
     agent._memory_enabled = False  # 记忆开关
+    agent._user_profile_enabled = False  # 用户画像（USER.md）开关
     agent._memory_manager = None  # 外部记忆提供者（原版 1699）
+    if not skip_memory:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _mem_cfg = (load_config_readonly().get("memory", None) or {})
+            agent._memory_enabled = bool(_mem_cfg.get("memory_enabled", False))
+            agent._user_profile_enabled = bool(_mem_cfg.get("user_profile_enabled", False))
+            if agent._memory_enabled or agent._user_profile_enabled:
+                from tools.memory_tool import MemoryStore
+
+                agent._memory_store = MemoryStore(
+                    memory_char_limit=int(_mem_cfg.get("memory_char_limit", 2200)),
+                    user_char_limit=int(_mem_cfg.get("user_char_limit", 1375)),
+                )
+                agent._memory_store.load_from_disk()
+        except Exception as _mem_exc:
+            logger.warning("Memory init failed (memory disabled): %s", _mem_exc)
     # system_prompt 守卫读取（原版 agent_init.py:1781/613；config 读取未实现，先用默认值）
     agent._tool_use_enforcement = "auto"  # 工具使用强制指导开关（auto/true/false/list）
     agent.pass_session_id = pass_session_id  # 是否在系统提示中暴露会话 ID

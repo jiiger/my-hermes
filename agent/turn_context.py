@@ -118,6 +118,14 @@ def build_turn_context(
     # 原版同样以「换新对象」而非 reset() 实现轮次间预算重置。
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
+    # 每回合重置内置记忆的整合失败预算（对应原版 turn_context.py:571，
+    # issue #42405）：防循环上限计「连续失败」，跨回合清零。
+    _reset_consol = getattr(
+        getattr(agent, "_memory_store", None), "reset_consolidation_failures", None
+    )
+    if callable(_reset_consol):
+        _reset_consol()
+
     # 记录执行线程，让 interrupt()/clear_interrupt() 能把工具级中断信号
     # 精确限定到本 agent 的线程（对应原版 turn_context.py:1237-1245）。
     agent._execution_thread_id = threading.current_thread().ident

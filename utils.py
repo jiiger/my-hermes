@@ -1,4 +1,6 @@
 import os
+import tempfile
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,6 +16,42 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in TRUTHY_STRINGS
     return bool(value)
+
+
+def atomic_write_text(
+    path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    tmp_prefix: str = ".tmp_",
+) -> None:
+    """通过临时文件 + fsync + 原子重命名写入文本。
+
+    对应原版 utils.py:139 atomic_write_text 的精简版：保留核心语义
+    （进程崩溃/中断时目标文件绝不处于半写入状态），砍掉原版的
+    preserve_mode / create_mode / symlink 处理等外围。
+
+    供 memory 工具等"整文件重写"场景使用：读者要么看到旧的完整文件，
+    要么看到新的完整文件，永远不会看到空文件或截断文件。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=tmp_prefix, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ─── Proxy Helpers ────────────────────────────────────────────────────────────

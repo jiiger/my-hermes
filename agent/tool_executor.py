@@ -122,7 +122,22 @@ def _run_tool(
         is_error = True
     else:
         try:
-            result = impl(**function_args)
+            if function_name == "memory":
+                # 内置记忆工具需要 agent 持有的 MemoryStore（模型不会传
+                # store 参数）。对齐原版 agent/tool_executor.py:1795 的
+                # memory 分支——其余工具仍走通用 impl(**args) 契约。
+                from tools.memory_tool import memory_tool as _memory_tool
+
+                result = _memory_tool(
+                    action=function_args.get("action"),
+                    target=function_args.get("target", "memory"),
+                    content=function_args.get("content"),
+                    old_text=function_args.get("old_text"),
+                    operations=function_args.get("operations"),
+                    store=getattr(agent, "_memory_store", None),
+                )
+            else:
+                result = impl(**function_args)
         except KeyboardInterrupt:
             # Ctrl+C 优雅中断（对齐原版 agent/tool_executor.py:1073）：
             # 转成协作式中断请求，工具标记为已取消，不冒泡退出
