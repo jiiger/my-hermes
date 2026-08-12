@@ -172,33 +172,22 @@ def run_conversation(
         _compressor = getattr(agent, "context_compressor", None)
         if _compressor is not None and _compressor.should_compress():
             if not agent._interrupt_requested:
-                _new_messages = _compressor.compress(messages)
+                # 压缩编排层：内部完成压缩前记忆通知、引擎调用、失败回滚、
+                # 压缩后系统提示失效 + 按需重建（对齐原版
+                # conversation_compression.py:compress_context），返回
+                # (压缩后消息, 新系统提示)。
+                from agent.conversation_compression import compress_context
+
+                _new_messages, _new_system_prompt = compress_context(
+                    agent,
+                    messages,
+                    system_message,
+                    approx_tokens=getattr(_compressor, "last_prompt_tokens", None) or None,
+                )
                 if len(_new_messages) < len(messages):
                     messages = _new_messages
-                    # 对齐原版 conversation_compression.py:3208-3255：
-                    # 压缩后系统提示失效 + 按需重建。内置记忆是压缩会重载
-                    # 的唯一系统提示输入（invalidate 里 load_from_disk），
-                    # 若重载后的记忆块已逐字包含在缓存提示里则保留原提示
-                    # （保住前缀缓存）；记忆变了才重建渲染新快照。重建后
-                    # 同步更新本轮循环的 active_system_prompt，让后续
-                    # API 调用立即用新提示（对齐原版重试路径语义）。
-                    from agent.system_prompt import (
-                        build_system_prompt as _build_system_prompt,
-                        cached_prompt_reflects_builtin_memory as _prompt_reflects_memory,
-                        invalidate_system_prompt as _invalidate_system_prompt,
-                    )
-
-                    _cached_prompt = getattr(agent, "_cached_system_prompt", None)
-                    _invalidate_system_prompt(agent)
-                    if _cached_prompt is not None and _prompt_reflects_memory(
-                        agent, _cached_prompt
-                    ):
-                        agent._cached_system_prompt = _cached_prompt
-                    else:
-                        agent._cached_system_prompt = _build_system_prompt(
-                            agent, system_message
-                        )
-                    active_system_prompt = agent._cached_system_prompt
+                    # 压缩后本轮循环立即使用新系统提示（对齐原版重试路径语义）
+                    active_system_prompt = _new_system_prompt
                     # 压缩保护 tail（含最近 user 消息）；若下标越界则重置
                     # 到最后一条 user 消息（保守，避免指向被压缩掉的中间轮）
                     if current_turn_user_idx >= len(messages):

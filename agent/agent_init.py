@@ -562,5 +562,8 @@ def init_agent(
             agent.context_compressor = None
     else:
         agent.context_compressor = None
+    # 惰性可行性探测标记（对齐原版 agent_init.py:2822）：check 不在 init
+    # 时直接跑（省冷启动开销），由 compress_context 首次压缩时探测一次。
+    agent._compression_feasibility_checked = False
 
     # TODO 。。。。。。
