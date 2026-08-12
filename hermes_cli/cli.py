@@ -725,10 +725,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     _print_banner(agent)
 
     # 带位置参数 → 单次查询；否则交互模式
-    if args.query:
-        once(agent, " ".join(args.query))
-    else:
-        interactive(agent)
+    try:
+        if args.query:
+            once(agent, " ".join(args.query))
+        else:
+            interactive(agent)
+    finally:
+        # 退出前优雅关闭 agent：外部记忆 provider（MemoryManager.
+        # shutdown_all 有界排空 + 逆序关闭）等资源释放。finally 覆盖
+        # 交互 break、单次查询的 sys.exit、以及异常路径。
+        try:
+            agent.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
