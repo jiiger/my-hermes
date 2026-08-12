@@ -432,6 +432,38 @@ def init_agent(
         agent.session_id = f"{timestamp_str}_{short_uuid}"
 
     # ══════════════════════════════════════════════════════════════
+    # ⑫½½ SessionDB（情节记忆）状态初始化（对应原版 agent_init.py 的
+    # session_db 接入；本任务移植最小版）
+    # ══════════════════════════════════════════════════════════════
+    # 调用方显式传入 session_db → 使用它，agent 不拥有、close 不关闭；
+    # 未传入 → 惰性创建（_get_session_db_for_recall 或首次 flush 时才
+    # 打开数据库，import/init 阶段绝不触碰磁盘）。
+    if session_db is not None:
+        agent._session_db = session_db
+        agent._owns_session_db = False
+    else:
+        agent._session_db = None
+        agent._owns_session_db = True  # 惰性打开后由本 agent 负责关闭
+    agent._session_db_created = False  # 会话行是否已幂等创建
+    # 持久化串行锁：直接 flush 与 close 兜底 flush 可能跨线程并发
+    agent._session_persist_lock = threading.Lock()
+    # 当前轮 user 消息的持久化覆盖（只影响 DB 行，不改 live messages）
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    # 增量持久化失败标记与最近错误（写失败返回 False 时置位）
+    agent._incremental_persistence_failed = False
+    agent._last_persistence_error = None
+    # flush 去重状态：一次性 id 种子 + 已冲刷前缀快照（对应原版
+    # _flushed_db_message_ids / _db_flush_scan_prefix）
+    agent._flushed_db_message_ids = set()
+    agent._last_flushed_db_idx = 0
+    agent._db_flush_scan_prefix = None
+    agent._flushed_db_message_session_id = None
+    # close() 兜底 flush 时使用的最新消息快照（由对话循环收尾写入）
+    agent._session_messages = None
+
+    # ══════════════════════════════════════════════════════════════
     # ⑫½ 外部记忆 provider（MemoryManager）——按原版 agent_init.py:1727-1790
     # 精简。读 config memory.provider → 插件加载器加载 → 注册进 MemoryManager
     # → initialize_all；provider 工具合并进 agent.tools / _tool_impls。

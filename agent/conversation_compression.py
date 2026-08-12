@@ -46,6 +46,28 @@ def sanitize_memory_context(memory_context: str) -> str:
     return sanitized[:1500] + "\n…[truncated]…\n" + sanitized[-1500:]
 
 
+def conversation_history_after_compression(
+    agent: Any,
+    messages: list,
+    previous_history: Optional[list] = None,
+) -> Optional[list]:
+    """压缩后返回正确的 flush baseline（对应原版
+    conversation_compression.py:1867 conversation_history_after_compression
+    的精简版）。
+
+    in-place 模式：``archive_and_compact`` 已把压缩后的消息写入当前
+    session 的 active 集，返回 ``list(messages)`` 让下一次 flush 按身份
+    跳过它们（只盖章不重写）——若返回 None，flush 会把压缩后的消息
+    当作新消息再次写入，造成重复。
+
+    legacy rotation 未移植（my-hermes 恒 in-place，不轮换 session_id）：
+    不伪造 rotation 存在，直接返回调用方传入的 previous_history。
+    """
+    if bool(getattr(agent, "_last_compaction_in_place", False)):
+        return list(messages)
+    return previous_history
+
+
 def _snapshot_compressor_attempt_state(compressor: Any) -> dict[str, Any]:
     """快照压缩器本轮 attempt 的关键状态（压缩失败/中止时回滚用）。
 
@@ -302,15 +324,50 @@ def compress_context(
         new_system_prompt = build_system_prompt(agent, system_message)
         agent._cached_system_prompt = new_system_prompt
 
-    # TODO 原版在此：SessionDB 会话提交——
-    #     1. commit_memory_session(messages)：转录被摘要替换前触发记忆提取；
-    #     2. in_place：archive_and_compact 软归档旧轮次 + 插入压缩后消息；
-    #     3. 轮换（in_place=False）：publish_compression_child 建子会话、
-    #        轮换 agent.session_id。
-    #     my-hermes 无 SessionDB，DB 接入后在此补会话落库。_last_compaction_in_place
-    #     语义：my-hermes 恒 in-place（不轮换 id）。
-    del in_place
-    agent._last_compaction_in_place = True
+    # 7½. SessionDB in-place 提交（对应原版 :3280 in-place 分支）。
+    #     1. archive_and_compact：软归档旧 active 消息（active=0,
+    #        compacted=1，保留可搜索/可恢复）+ 插入压缩后消息
+    #        （summary + 保留的 tail，active=1, compacted=0），单事务原子；
+    #     2. 事务成功后才置位 _last_compaction_in_place 并清空 flush
+    #        一次性 id 种子——压缩后的 dict 已是 DB active 集，后续 flush
+    #        以压缩后消息为 baseline（不重复写）。
+    #     legacy rotation（in_place=False，轮换 session_id）明确裁剪：
+    #     my-hermes 恒 in-place，不轮换 id；后续如需轮换在此扩展。
+    _db = getattr(agent, "_session_db", None)
+    if in_place and _db is not None and getattr(agent, "session_id", None):
+        try:
+            _db.archive_and_compact(
+                agent.session_id,
+                compressed,
+            )
+            agent._last_compaction_in_place = True
+            agent._flushed_db_message_ids = set()
+        except BaseException as _db_exc:
+            # DB 提交失败：回滚内存消息与 attempt 状态，保持"压缩未发生"
+            # 语义——不改变 DB 的 active/inactive 状态、不更新 baseline、
+            # 返回原消息；下一次压缩可重试（对齐原版失败回滚）。
+            _restore_compressor_attempt_state(
+                agent.context_compressor, _compressor_attempt_snapshot
+            )
+            if messages != messages_before_compression:
+                messages[:] = copy.deepcopy(messages_before_compression)
+            logger.warning(
+                "archive_and_compact failed (%s); compression rolled back — "
+                "session=%s continues unchanged.",
+                _db_exc,
+                getattr(agent, "session_id", "") or "none",
+            )
+            return messages, _existing_system_prompt(agent, system_message)
+    else:
+        # 无 SessionDB 或（理论上不出现的）rotation 配置：纯内存 in-place
+        # 压缩（不落库，行为与之前一致）。
+        if not in_place:
+            logger.warning(
+                "legacy rotation compression is not implemented in my-hermes; "
+                "falling back to in-place (session=%s).",
+                getattr(agent, "session_id", "") or "none",
+            )
+        agent._last_compaction_in_place = True
 
     # 8. 收尾：记录粗略 token 估算（对齐原版 :3658）
     try:

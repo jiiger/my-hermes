@@ -80,6 +80,32 @@ def build_turn_context(
 
     # 净化用户消息：去掉孤立代理对字符，防止下游编码错误
     user_message = sanitize_surrogates(user_message)
+    if isinstance(persist_user_message, str):
+        persist_user_message = sanitize_surrogates(persist_user_message)
+
+    # 挂载 persist override 状态（只影响写库行，不改 live messages；
+    # 下标在 user 消息入列后更新，对应原版 turn_context.py:537-539）
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = persist_user_message
+    agent._persist_user_message_timestamp = persist_user_timestamp
+
+    # 会话历史默认来源：调用方显式传入的 conversation_history 优先；
+    # 未传入但配置了 SessionDB 时，从 state.db 恢复既有消息作为默认历史
+    # （对应原版 turn_context.py:465-468 的恢复路径）。
+    if conversation_history is None:
+        _db = getattr(agent, "_session_db", None)
+        _session_id = getattr(agent, "session_id", None)
+        if _db is not None and _session_id:
+            try:
+                # 恢复当前活动上下文：默认只读 active=1 消息（压缩归档的
+                # 旧消息不进入工作上下文；对应原版
+                # get_messages_as_conversation 语义）。
+                _restored = _db.get_messages_as_conversation(_session_id)
+                if _restored:
+                    conversation_history = _restored
+            except Exception:
+                # 恢复失败不阻断回合：退化为无历史
+                conversation_history = None
 
     # 复制历史，避免修改调用方的列表（对应原版 turn_context.py:524）
     messages = list(conversation_history) if conversation_history else []
@@ -93,6 +119,7 @@ def build_turn_context(
     messages.append(user_msg)
     # 当前用户消息在 messages 中的下标（压缩/续写等场景需要定位它）
     current_turn_user_idx = len(messages) - 1
+    agent._persist_user_message_idx = current_turn_user_idx
 
     # 保留干净的用户消息原文（持久化/记忆查询用，不做任何注入）
     original_user_message = (
@@ -103,6 +130,14 @@ def build_turn_context(
     if getattr(agent, "_cached_system_prompt", None) is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = getattr(agent, "_cached_system_prompt", None)
+
+    # 幂等创建 SessionDB 会话行（此时 _cached_system_prompt 已就绪，
+    # 快照能带上非 NULL 系统提示；对应原版 turn_context.py:721-739）。
+    # 失败只警告，不阻断回合——首次 flush 会重试。
+    try:
+        agent._ensure_db_session()
+    except Exception:
+        pass
 
     # 外部记忆 provider：通知新回合 + 回合前召回（prefetch_all）。
     # 跳过琐碎提示（问候/确认）——零信号文本不值得召回（对齐原版

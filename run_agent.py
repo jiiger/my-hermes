@@ -16,6 +16,11 @@ from utils import base_url_hostname
 
 logger = logging.getLogger(__name__)
 
+# 消息 dict 上标记"已写入 SessionDB"的内部键（对应原版
+# run_agent.py:_DB_PERSISTED_MARKER）。flush 用它去重：已标记的消息
+# 后续 flush 直接跳过，不依赖 list 切片长度（压缩会重建列表）。
+_DB_PERSISTED_MARKER = "_db_persisted"
+
 
 class AIAgent:
     @property
@@ -866,6 +871,209 @@ class AIAgent:
 
         return copy_reasoning_content_for_api(self, source_msg, api_msg)
 
+    # ───────────────────────── SessionDB（情节记忆）─────────────────────────
+
+    def _get_session_db_for_recall(self):
+        """返回 SessionDB 供检索，未注入时惰性打开默认 state.db。
+
+        对应原版 run_agent.py:600 _get_session_db_for_recall：大部分调用方
+        显式传入 session_db，但历史检索值得在缺失时降级打开默认库；
+        惰性打开的库由本 agent 拥有，close() 负责关闭。
+        """
+        if self._session_db is not None:
+            return self._session_db
+        try:
+            from hermes_state import SessionDB
+
+            self._session_db = SessionDB()
+            # 这里打开的是默认库，本 agent 是唯一持有者
+            self._owns_session_db = True
+            return self._session_db
+        except Exception:
+            logger.debug("SessionDB unavailable for recall", exc_info=True)
+            return None
+
+    def _ensure_db_session(self) -> None:
+        """首次使用时幂等创建 SessionDB 会话行；失败保留重试机会。
+
+        对应原版 run_agent.py:628 _ensure_db_session：_session_db_created
+        置位前失败只记警告，下次 flush 会重试；成功后才置位。
+        """
+        if self._session_db_created or not self._session_db:
+            return
+        source = str(getattr(self, "platform", "") or "cli") or "cli"
+        try:
+            self._session_db.create_session(
+                session_id=self.session_id,
+                source=source,
+                model=getattr(self, "model", None),
+                system_prompt=getattr(self, "_cached_system_prompt", None),
+            )
+            self._session_db_created = True
+        except Exception as e:
+            # 瞬时失败（如锁竞争）：_session_db_created 保持 False，下次重试
+            self._last_persistence_error = str(e)
+            logger.warning(
+                "Session DB creation failed (will retry next flush): %s", e
+            )
+
+    def _flush_messages_to_session_db(
+        self,
+        messages: List[Dict],
+        conversation_history: Optional[List[Dict]] = None,
+    ):
+        """带锁的会话持久化入口（对应原版 run_agent.py:1998）。
+
+        返回 True 表示本次 flush 成功；False 表示写入失败
+        （_incremental_persistence_failed 已置位，可下次重试）；
+        未启用 DB 时返回 None。
+        """
+        persist_lock = getattr(self, "_session_persist_lock", None)
+        if persist_lock is None:
+            return self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history
+            )
+        with persist_lock:
+            return self._flush_messages_to_session_db_unlocked(
+                messages, conversation_history
+            )
+
+    def _flush_messages_to_session_db_unlocked(
+        self,
+        messages: List[Dict],
+        conversation_history: Optional[List[Dict]] = None,
+    ):
+        """把未写入 SessionDB 的消息追加落库（对应原版 run_agent.py:2010）。
+
+        去重机制：
+        - 每条消息 dict 上盖章 ``_DB_PERSISTED_MARKER``，已写即跳过；
+        - conversation_history 中的 dict（同一对象）视为已持久化历史，
+          只盖章不重写——因此调用方显式传入的既有历史不会重复落库；
+        - 压缩重建出的新 dict（浅拷贝）会当作新消息写入，其中 head/tail
+          历史通过把压缩后列表作为 conversation_history 传入而跳过。
+
+        落库行规则：
+        - persist_user_message / timestamp 覆盖只作用于写库的行，
+          绝不动 live messages；
+        - content 为 list 时只保留文本部分，图片转 ``[screenshot]``，
+          禁止把 base64 大图写进 state.db；
+        - tool_calls 原样 JSON 序列化。
+
+        写失败返回 False 并置位 _incremental_persistence_failed 与
+        _last_persistence_error；下一次 flush 重新扫描（前缀快照清空）。
+        """
+        if not self._session_db:
+            return None
+        try:
+            # 会话行可能尚未创建（首轮），补一次幂等创建
+            if not self._session_db_created:
+                self._ensure_db_session()
+                if not self._session_db_created:
+                    return False  # 创建失败，等待下次 flush 重试
+
+            current_session_id = getattr(self, "session_id", None)
+            flushed_session_id = getattr(self, "_flushed_db_message_session_id", None)
+            if flushed_session_id != current_session_id or self._last_flushed_db_idx == 0:
+                seed_ids = set()
+            else:
+                seed_ids = getattr(self, "_flushed_db_message_ids", None)
+                if not isinstance(seed_ids, set):
+                    seed_ids = set()
+            self._flushed_db_message_session_id = current_session_id
+            history_ids = {
+                id(item)
+                for item in (conversation_history or [])
+                if isinstance(item, dict)
+            }
+
+            # 有界扫描：跳过与上次成功 flush 快照同对象的前缀
+            _scan_start = 0
+            _prev_prefix = getattr(self, "_db_flush_scan_prefix", None)
+            if isinstance(_prev_prefix, list):
+                _limit = min(len(_prev_prefix), len(messages))
+                while (
+                    _scan_start < _limit
+                    and messages[_scan_start] is _prev_prefix[_scan_start]
+                ):
+                    _scan_start += 1
+
+            _batch_rows: List[Dict] = []
+            _batch_msgs: List[Dict] = []
+            _ov_idx = getattr(self, "_persist_user_message_idx", None)
+            _ov_content = getattr(self, "_persist_user_message_override", None)
+            _ov_timestamp = getattr(self, "_persist_user_message_timestamp", None)
+            for _msg_idx in range(_scan_start, len(messages)):
+                msg = messages[_msg_idx]
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get(_DB_PERSISTED_MARKER):
+                    continue
+                # 已在历史/种子里的消息：视为已持久化，盖章跳过
+                if id(msg) in history_ids or id(msg) in seed_ids:
+                    msg[_DB_PERSISTED_MARKER] = True
+                    continue
+                role = msg.get("role", "unknown")
+                content = msg.get("content")
+                _row_timestamp = msg.get("timestamp")
+                # persist override 只写库、不改 live（对应原版 #48677）
+                if _ov_idx == _msg_idx and role == "user":
+                    if _ov_content is not None and (
+                        not isinstance(content, list) or isinstance(_ov_content, list)
+                    ):
+                        content = _ov_content
+                    if _ov_timestamp is not None:
+                        _row_timestamp = _ov_timestamp
+                # 多模态/结构化 content：只保留文本，图片转占位符
+                if isinstance(content, list):
+                    _txt = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "text":
+                            _txt.append(str(part.get("text", "")))
+                        elif part.get("type") in {"image", "image_url", "input_image"}:
+                            _txt.append("[screenshot]")
+                    content = "\n".join(_txt) if _txt else None
+                tool_calls_data = None
+                if isinstance(msg.get("tool_calls"), list):
+                    tool_calls_data = msg["tool_calls"]
+                _batch_rows.append({
+                    "role": role,
+                    "content": content,
+                    "tool_name": msg.get("tool_name"),
+                    "tool_calls": tool_calls_data,
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "finish_reason": msg.get("finish_reason"),
+                    "reasoning": msg.get("reasoning"),
+                    "reasoning_content": msg.get("reasoning_content"),
+                    "timestamp": _row_timestamp,
+                    "api_content": msg.get("api_content"),
+                    "display_kind": msg.get("display_kind"),
+                    "display_metadata": msg.get("display_metadata"),
+                })
+                _batch_msgs.append(msg)
+
+            # 单事务写整批；失败时不盖章、不回写前缀快照，下次全量重扫
+            if _batch_rows:
+                self._session_db.append_messages_batch(
+                    session_id=self.session_id,
+                    messages=_batch_rows,
+                )
+                for _written in _batch_msgs:
+                    _written[_DB_PERSISTED_MARKER] = True
+            self._flushed_db_message_ids = set()
+            self._last_flushed_db_idx = len(messages)
+            self._db_flush_scan_prefix = messages[:]
+            self._incremental_persistence_failed = False
+            return True
+        except Exception as e:
+            # 异常中断：清空前缀快照，下次 flush 从 0 重扫
+            self._db_flush_scan_prefix = None
+            self._incremental_persistence_failed = True
+            self._last_persistence_error = str(e)
+            logger.warning("Session DB append failed: %s", e)
+            return False
+
     def _reset_activity_labels_after_turn(self) -> None:
         """清理本轮遗留的活动标签（如"压缩中/执行工具中"等展示状态）。
 
@@ -909,12 +1117,39 @@ class AIAgent:
         invalidate_system_prompt(self)
 
     def close(self) -> None:
-        """关闭 agent，释放资源（对应原版 AIAgent.close 的记忆部分）。
+        """关闭 agent，释放资源（对应原版 AIAgent.close 的 SessionDB + 记忆部分）。
 
-        my-hermes 无 SessionDB / 进程注册表 / 终端沙箱等，只关闭外部记忆
-        provider（MemoryManager.shutdown_all：有界排空 + 逆序关闭）。
+        SessionDB 收尾顺序（对齐原版 run_agent.py:4417-4445）：
+        1. 尽力 flush 最后已知消息（_session_messages，对话循环收尾写入）；
+        2. end_session("agent_close") 终结会话行（首个 end_reason 生效）；
+        3. 只关闭本 agent 自己创建的 DB（外部注入的 session_db 不关闭）。
+        其余资源：关闭外部记忆 provider（MemoryManager.shutdown_all）。
         幂等可重复调用。
         """
+        # ① 兜底 flush 最后已知消息快照（若有）
+        _session_messages = getattr(self, "_session_messages", None)
+        if _session_messages:
+            try:
+                self._flush_messages_to_session_db(_session_messages)
+            except Exception:
+                pass
+        # ② 终结会话行（幂等；已结束则 no-op）
+        _session_db = getattr(self, "_session_db", None)
+        try:
+            if _session_db is not None and getattr(self, "session_id", None):
+                _session_db.end_session(
+                    getattr(self, "session_id"), "agent_close"
+                )
+        except Exception:
+            pass
+        # ③ 只关闭自己创建的 DB（外部注入的会话库留给调用方管理）
+        try:
+            if getattr(self, "_owns_session_db", False) and _session_db is not None:
+                self._owns_session_db = False
+                _session_db.close()
+        except Exception:
+            pass
+        # 外部记忆 provider 关闭（原有逻辑保留）
         _mm = getattr(self, "_memory_manager", None)
         if _mm is not None:
             try:
