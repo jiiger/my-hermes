@@ -313,6 +313,114 @@ class AIAgent:
         """
         self._current_streamed_assistant_text = ""
 
+    # ─── interim 中间旁白交付（对应原版 run_agent.py:6216-6420 精简版）───
+
+    def _strip_think_blocks(self, content: str) -> str:
+        """转发器 — 见 agent.agent_runtime_helpers.strip_think_blocks。"""
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        return strip_think_blocks(self, content)
+
+    @staticmethod
+    def _normalize_interim_visible_text(text: str) -> str:
+        """归一化中间文本：空白折叠 + 去首尾（供去重键比较）。"""
+        if not isinstance(text, str):
+            return ""
+        import re as _re
+
+        return _re.sub(r"\s+", " ", text).strip()
+
+    def _interim_assistant_visible_text(self, assistant_msg: dict) -> str:
+        """返回 assistant 消息中可交付的中间可见文本（剥推理块 + 展平）。
+
+        对应原版 run_agent.py:6296 的精简版：砍掉 codex commentary 优先
+        分支，只处理顶层 content（字符串或结构块列表）。
+        """
+        content = assistant_msg.get("content")
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    ptype = str(part.get("type") or "").strip().lower()
+                    if ptype in {"thinking", "reasoning", "redacted_thinking"}:
+                        continue
+                    ptext = part.get("text")
+                    if isinstance(ptext, str) and ptext:
+                        parts.append(ptext)
+            text = "\n".join(parts)
+        elif isinstance(content, dict):
+            text = str(content.get("text") or content.get("content") or "")
+        else:
+            text = str(content)
+        return self._strip_think_blocks(text).strip()
+
+    def _interim_text_was_delivered(self, text: str) -> bool:
+        """中间文本是否已交付过（归一化查重）。"""
+        normalized = self._normalize_interim_visible_text(text)
+        if not normalized:
+            return False
+        return normalized in getattr(self, "_delivered_interim_texts", set())
+
+    def _record_delivered_interim_text(self, text: str) -> None:
+        """记录中间文本已交付。"""
+        normalized = self._normalize_interim_visible_text(text)
+        if normalized:
+            delivered = getattr(self, "_delivered_interim_texts", None)
+            if not isinstance(delivered, set):
+                delivered = set()
+                self._delivered_interim_texts = delivered
+            delivered.add(normalized)
+
+    def _interim_content_was_streamed(self, content: str) -> bool:
+        """内容是否已作为流式 delta 显示过（前缀匹配，非精确相等）。
+
+        最终响应可能是流式文本 + 尾部增量，或流在旁白触发时只发了一部分；
+        两种情况流式内容都是最终的**前缀**——前缀匹配足够标记"已预览"，
+        失败方向退化为无害的重复，绝不丢文本（对齐原版 #65919 review）。
+        """
+        visible = self._normalize_interim_visible_text(
+            self._strip_think_blocks(content or "")
+        )
+        if not visible:
+            return False
+        streamed = self._normalize_interim_visible_text(
+            self._strip_think_blocks(
+                getattr(self, "_current_streamed_assistant_text", "") or ""
+            )
+        )
+        return bool(streamed) and visible.startswith(streamed)
+
+    def _emit_interim_assistant_message(self, assistant_msg: dict) -> None:
+        """把工具循环中的中间旁白消息推给 UI 层（interim_assistant_callback）。
+
+        对应原版 run_agent.py:6344 的精简版：砍掉 codex commentary 分支与
+        redact 脱敏（my-hermes 无 redact 模块）。去重依赖每回合重置的
+        _delivered_interim_texts。不设置 _response_was_previewed——本方法
+        处理的是普通旁白/中间确认，与最终回答的预览标记无关。
+        """
+        cb = getattr(self, "interim_assistant_callback", None)
+        if cb is None or not isinstance(assistant_msg, dict):
+            return
+        visible = self._interim_assistant_visible_text(assistant_msg)
+        if (
+            not visible
+            or visible == "(empty)"
+            or self._interim_text_was_delivered(visible)
+        ):
+            return
+        already_streamed = self._interim_content_was_streamed(visible)
+        try:
+            cb(visible, already_streamed=already_streamed)
+            self._record_delivered_interim_text(visible)
+        except Exception:
+            logger.debug("interim_assistant_callback error", exc_info=True)
+
     def interrupt(self, message: Optional[str] = None, *, hard_cancel: bool = False) -> None:
         """请求中断当前工具循环（对齐原版 run_agent.py:3091）。
 

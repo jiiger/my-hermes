@@ -133,7 +133,10 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
-    # 本轮已交付的流式片段集合（供去重；精简版暂无流式，先占位）
+    # 本轮已交付的中间（interim）旁白文本集合（供去重）。流式响应已实现
+    # （_interruptible_streaming_api_call 逐增量触发回调），但"工具循环
+    # 中间旁白交付"（interim_assistant_callback 去重推送）尚未移植——
+    # 本属性占位，待 interim 交付实现后激活（对齐原版 run_agent.py:6313）。
     agent._delivered_interim_texts = set()
     # 增量持久化失败标记（配置的 SessionDB 追加失败只影响本轮；精简版暂无 DB）
     agent._incremental_persistence_failed = False
@@ -447,11 +450,17 @@ def run_conversation(
                         "arguments": tc.function.arguments,
                     },
                 })
-            messages.append({
+            _interim_msg = {
                 "role": "assistant",
                 "content": assistant_message.content or "",
                 "tool_calls": tool_calls_payload,
-            })
+            }
+            messages.append(_interim_msg)
+            # interim 中间旁白交付：模型在调工具时说的"让我先看看…"这类
+            # 旁白实时推给 UI（interim_assistant_callback + 去重），
+            # 对齐原版 conversation_loop.py:6279 的调用点。
+            if getattr(agent, "interim_assistant_callback", None) is not None:
+                agent._emit_interim_assistant_message(_interim_msg)
 
             # 顺序执行工具调用：结果以 role="tool" 消息追加进 messages
             # （对应原版 6365 行）
