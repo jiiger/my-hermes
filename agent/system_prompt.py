@@ -228,5 +228,51 @@ def invalidate_system_prompt(agent: Any) -> None:
     - 记忆模块未实现时 _memory_store 为 None，跳过磁盘重载。
     """
     agent._cached_system_prompt = None
-    if agent._memory_store:
-        agent._memory_store.load_from_disk()
+    _store = getattr(agent, "_memory_store", None)
+    if _store is not None:
+        _store.load_from_disk()
+
+
+def cached_prompt_reflects_builtin_memory(agent: Any, cached_prompt: str) -> bool:
+    """判断缓存系统提示是否已包含当前内置记忆块。
+
+    对应原版 agent/conversation_compression.py:211
+    _cached_prompt_reflects_builtin_memory 的精简版，供压缩后
+    "保留 or 重建"系统提示判定使用。
+
+    语义：重载后的 memory/user 块必须**逐字**出现在缓存提示里（渲染文本
+    含用量头，任何条目/字符数变化都会破坏包含关系 → 重建）；已清空或
+    禁用的目标不能在提示里残留块头（MEMORY_BLOCK_HEADERS），否则视为
+    过期 → 重建。无内置记忆时返回 True（记忆不是重建理由，对齐原版
+    _builtin_memory_prompt_snapshot 返回空块的行为）。my-hermes 无外部
+    memory_manager（恒 None），不需要原版的"有外部 provider 时强制重建"
+    分支。
+    """
+    store = getattr(agent, "_memory_store", None)
+    if store is None:
+        return True
+    try:
+        from tools.memory_tool import MEMORY_BLOCK_HEADERS
+
+        memory = (
+            store.format_for_system_prompt("memory") or ""
+            if getattr(agent, "_memory_enabled", False)
+            else ""
+        )
+        user = (
+            store.format_for_system_prompt("user") or ""
+            if getattr(agent, "_user_profile_enabled", False)
+            else ""
+        )
+    except Exception:
+        return False
+
+    for target, block in (("memory", memory), ("user", user)):
+        block = block.strip()
+        if block:
+            if block not in cached_prompt:
+                return False
+        elif MEMORY_BLOCK_HEADERS[target] in cached_prompt:
+            # 目标已清空/禁用但提示仍带它的块头——过期，需重建
+            return False
+    return True
