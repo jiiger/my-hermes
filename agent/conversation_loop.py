@@ -134,6 +134,17 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # 每轮开始恢复主 provider：上一轮若激活了 fallback，本轮回到主
+    # provider（fallback 是"回合内"行为，对齐原版 turn_context.py:482 的
+    # agent._restore_primary_runtime()）。恢复失败保持回退，不阻断回合。
+    _restore_primary = getattr(agent, "_restore_primary_runtime", None)
+    if callable(_restore_primary):
+        try:
+            _restore_primary()
+        except Exception:
+            pass
+    _try_fallback = getattr(agent, "_try_activate_fallback", None)
+
     # 本轮已交付的中间（interim）旁白文本集合（供去重）。流式响应已实现
     # （_interruptible_streaming_api_call 逐增量触发回调），但"工具循环
     # 中间旁白交付"（interim_assistant_callback 去重推送）尚未移植——
@@ -393,23 +404,25 @@ def run_conversation(
                     _turn_exit_reason = "interrupted_by_user"
                     break
                 except Exception as exc:
+                    # 错误分类（无条件）：决定 重试 / 压缩 / 回退
+                    _classified = classify_api_error(
+                        exc,
+                        provider=getattr(agent, "provider", "") or "",
+                        model=getattr(agent, "model", "") or "",
+                        approx_tokens=getattr(_compressor, "last_prompt_tokens", 0)
+                        or 0,
+                        context_length=getattr(_compressor, "context_length", 0) or 0,
+                        num_messages=len(messages) if messages else 0,
+                    )
                     # 错误触发压缩：上下文溢出类错误（context_overflow /
                     # payload_too_large）标记 should_compress=True，压缩历史后
                     # 设置标志并跳出内层循环，由外层退款 + 重新组装重试
-                    # （对齐原版 restart_with_compressed_messages 语义）
+                    # （对齐原版 restart_with_compressed_messages 语义）。
+                    # 压缩优先于回退：先救上下文，救不动再换 provider。
                     if (
                         _compressor is not None
                         and compression_attempts < _max_compression_attempts
                     ):
-                        _classified = classify_api_error(
-                            exc,
-                            provider=getattr(agent, "provider", "") or "",
-                            model=getattr(agent, "model", "") or "",
-                            approx_tokens=getattr(_compressor, "last_prompt_tokens", 0)
-                            or 0,
-                            context_length=getattr(_compressor, "context_length", 0) or 0,
-                            num_messages=len(messages) if messages else 0,
-                        )
                         if _classified.should_compress:
                             compression_attempts += 1
                             # 与主动压缩统一走 compress_context：内部完成
@@ -441,12 +454,36 @@ def run_conversation(
                                         f"（第 {compression_attempts}/{_max_compression_attempts} 次）"
                                     )
                                 break
+                    # 立即回退：认证/计费/模型不存在类错误原样重试无意义
+                    # （classify_api_error 已置 should_fallback=True），直接
+                    # 沿回退链换 provider 重试。
+                    if (
+                        _classified.should_fallback
+                        and callable(_try_fallback)
+                        and _try_fallback(_classified.reason)
+                    ):
+                        retry_count = 0
+                        if not getattr(agent, "quiet_mode", False):
+                            agent._safe_print(
+                                f"🔄 已切换到回退模型 {agent.model} "
+                                f"({agent.provider})，重试..."
+                            )
+                        continue
                     retry_count += 1
                     if retry_count >= max_retries:
-                        # 重试耗尽：本轮标记失败，错误信息作为最终回复返回。
-                        # TODO fallback：原版此处分类错误（classify_api_error）后
-                        #     尝试切换到回退 provider（try_activate_fallback），
-                        #     功能待实现（agent_init 已保留 fallback_model 参数）
+                        # 重试耗尽：先尝试切换到回退 provider（成功则清零
+                        # 重试计数、换新后端继续）；链也耗尽才标记本轮失败。
+                        if (
+                            callable(_try_fallback)
+                            and _try_fallback(_classified.reason)
+                        ):
+                            retry_count = 0
+                            if not getattr(agent, "quiet_mode", False):
+                                agent._safe_print(
+                                    f"🔄 已切换到回退模型 {agent.model} "
+                                    f"({agent.provider})，重试..."
+                                )
+                            continue
                         failed = True
                         _turn_exit_reason = "api_failed"
                         final_response = f"API 调用失败（已重试 {max_retries} 次）: {exc}"

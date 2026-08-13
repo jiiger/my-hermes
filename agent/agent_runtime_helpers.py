@@ -1,9 +1,12 @@
 """运行时辅助（精简移植版）。
 
-client 创建/关闭 + strip_think_blocks（interim 旁白交付用）。
+client 创建/关闭 + strip_think_blocks（interim 旁白交付用）
++ restore_primary_runtime（每轮开始恢复主 provider，对应原版
+agent_runtime_helpers.py:1459 的精简版）。
 """
 
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import base_url_host_matches
@@ -59,6 +62,56 @@ def create_openai_client(
         agent._client_log_context(),
     )
     return client
+
+
+def restore_primary_runtime(agent) -> bool:
+    """回合开始时恢复主 provider（对应原版 agent_runtime_helpers.py:1459 精简版）。
+
+    长会话里同一个 AIAgent 跨多轮复用。若上一轮激活了 fallback，不恢复的话
+    一次瞬时故障会把整个会话钉在回退 provider 上。每轮开始调用本函数让
+    fallback 成为"回合内"行为：
+
+    - 未激活 fallback：只重置回退链游标（防 #20465：链耗尽但未激活时
+      游标卡在链尾，阻塞后续所有回退尝试），返回 False；
+    - 激活过但主 provider 仍在限流冷却（_rate_limited_until 未到）：保持
+      回退，返回 False；
+    - 否则从 _primary_runtime 快照恢复主 provider 的 model/provider/
+      base_url/api_key/_client_kwargs，并用 create_openai_client 重建共享
+      client，重置回退状态，返回 True。
+
+    精简版不移植原版的 credential_pool / 压缩引擎 / 传输缓存恢复——
+    my-hermes 无这些组件。
+    """
+    if not getattr(agent, "_fallback_activated", False):
+        agent._fallback_index = 0
+        return False
+
+    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+        return False  # 主 provider 仍在冷却，保持回退
+
+    rt = getattr(agent, "_primary_runtime", None)
+    if not rt:
+        # 快照缺失（异常路径）：清状态，退回主 provider 属性不动
+        agent._fallback_activated = False
+        agent._fallback_index = 0
+        return False
+
+    try:
+        agent.model = rt["model"]
+        agent.provider = rt["provider"]
+        agent.base_url = rt["base_url"]
+        agent.api_key = rt["api_key"]
+        agent._client_kwargs = dict(rt["client_kwargs"])
+        agent.client = create_openai_client(
+            agent, dict(rt["client_kwargs"]), reason="restore_primary", shared=True
+        )
+    except Exception as e:  # pragma: no cover - 恢复失败保持回退
+        _ra().logger.warning("Restore primary runtime failed: %s", e)
+        return False
+
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+    return True
 
 
 def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:

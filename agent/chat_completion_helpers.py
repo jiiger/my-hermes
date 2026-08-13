@@ -2,12 +2,18 @@
 
 当前实现：interruptible_api_call（非流式 + 中断 + stale 超时）与
 interruptible_streaming_api_call（流式 + delta 回调 + 工具调用聚合）；
-回退（try_activate_fallback）已暂删，功能待实现。
+回退（try_activate_fallback）精简版：沿 _fallback_chain 切换 provider
+（对应原版 chat_completion_helpers.py:1923）。
 """
 
+import logging
 import threading
 import time
 from typing import Any, Dict, Optional
+
+from agent.error_classifier import FailoverReason
+
+logger = logging.getLogger(__name__)
 
 
 def _make_worker_client(agent) -> Any:
@@ -119,6 +125,126 @@ def interruptible_api_call(
     if result["error"] is not None:
         raise result["error"]
     return result["response"]
+
+
+# ── Fallback（回退）──────────────────────────────────────────────────────
+
+# 限流冷却指数退避上限（原版 60s → 2m → 4m → … → 4h cap）
+_RATE_LIMIT_BACKOFF_CAP_S = 14400
+_FALLBACK_EXHAUSTED_COOLDOWN_S = 60
+
+
+def try_activate_fallback(
+    agent, reason: "FailoverReason | None" = None
+) -> bool:
+    """切换到回退链上的下一个 provider（对应原版 chat_completion_helpers.py:1923 精简版）。
+
+    当前 provider 重试耗尽后调用。就地换掉 agent 的 OpenAI client、模型
+    名与 provider，让外层重试循环用新后端继续。每次调用沿
+    ``agent._fallback_chain`` 前进一格；链耗尽返回 False。
+
+    精简版差异（相对原版）：
+    - 只支持 OpenAI 兼容 chat_completions（无 Anthropic/Bedrock/MoA 分支、
+      无 resolve_provider_client / credential_pool / BackendIdentity）；
+    - 回退 client 用 my-hermes 的 create_openai_client 工厂构建；
+    - 同后端跳过简化为 provider+model+base_url 字符串比较；
+    - 无 _unavailable_fallback_keys 本会话禁用集合。
+    """
+    # 限流/计费类失败：给主 provider 记冷却（指数退避），供
+    # restore_primary_runtime 判断"何时允许恢复主 provider"。
+    if reason in {
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+        FailoverReason.upstream_rate_limit,
+    }:
+        backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
+        agent._rate_limit_backoff_count = backoff_count + 1
+        backoff_seconds = min(
+            60 * (2 ** backoff_count), _RATE_LIMIT_BACKOFF_CAP_S
+        )
+        agent._rate_limited_until = time.monotonic() + backoff_seconds
+        logger.info(
+            "Rate-limit backoff level %d: cooldown %d s",
+            backoff_count, backoff_seconds,
+        )
+
+    chain = getattr(agent, "_fallback_chain", None) or []
+    index = getattr(agent, "_fallback_index", 0)
+    if index >= len(chain):
+        # 链耗尽：非限流/计费类失败时也记一个短冷却，避免下一轮
+        # restore_primary_runtime 立刻清零游标导致跨轮重放风暴（原版 #24996）。
+        if len(chain) > 0 and reason not in {
+            FailoverReason.rate_limit,
+            FailoverReason.billing,
+            FailoverReason.upstream_rate_limit,
+        }:
+            existing = getattr(agent, "_rate_limited_until", 0) or 0
+            agent._rate_limited_until = max(
+                existing, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S
+            )
+        return False
+
+    fb = chain[index]
+    agent._fallback_index = index + 1
+
+    fb_provider = (fb.get("provider") or "").strip()
+    fb_model = (fb.get("model") or "").strip()
+    if not fb_provider or not fb_model:
+        return try_activate_fallback(agent, reason)  # 跳过无效条目
+
+    # 同后端跳过：链上条目与当前 provider/model/base_url 一致时回退等于
+    # 原地失败循环，跳过继续（精简版字符串比较，原版用 BackendIdentity）。
+    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    current_base_url = (getattr(agent, "base_url", "") or "").strip().rstrip("/").lower()
+    fb_base_url = (fb.get("base_url") or "").strip().rstrip("/")
+    if (
+        fb_provider.lower() == current_provider
+        and fb_model == getattr(agent, "model", "")
+        and fb_base_url.lower() == current_base_url
+    ):
+        return try_activate_fallback(agent, reason)
+
+    # 首次切换：保存主运行时快照，供 restore_primary_runtime 恢复
+    if not getattr(agent, "_primary_runtime", None):
+        agent._primary_runtime = {
+            "model": getattr(agent, "model", ""),
+            "provider": getattr(agent, "provider", ""),
+            "base_url": getattr(agent, "base_url", "") or "",
+            "api_key": getattr(agent, "api_key", "") or "",
+            "client_kwargs": dict(
+                getattr(agent, "_client_kwargs", None) or {}
+            ),
+        }
+
+    # 回退条目的 base_url / api_key 缺失时沿用主 provider 的（同原版
+    # resolve_entry_api_key 的宽松语义）。
+    fb_api_key = (fb.get("api_key") or "").strip() or (
+        getattr(agent, "api_key", "") or ""
+    )
+    fb_kwargs = {"api_key": fb_api_key, "base_url": fb_base_url}
+
+    try:
+        from agent.agent_runtime_helpers import create_openai_client
+
+        fb_client = create_openai_client(
+            agent, dict(fb_kwargs), reason="fallback", shared=True
+        )
+    except Exception as e:  # pragma: no cover - 建 client 失败跳过该条目
+        logger.warning(
+            "Fallback client creation failed for %s/%s: %s",
+            fb_provider, fb_model, e,
+        )
+        return try_activate_fallback(agent, reason)
+
+    agent.model = fb_model
+    agent.provider = fb_provider
+    agent.base_url = fb_base_url
+    agent.api_key = fb_api_key
+    agent._client_kwargs = dict(fb_kwargs)
+    agent.client = fb_client
+    agent._fallback_activated = True
+    logger.info("Fallback activated: %s/%s", fb_provider, fb_model)
+    return True
 
 
 # ── 流式（第三步）──────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from agent import relay_runtime
+from agent.error_classifier import FailoverReason
 from agent.interrupt_compat import request_hard_interrupt
 from agent.iteration_budget import IterationBudget
 from agent.process_bootstrap import OpenAI, _get_proxy_for_base_url
@@ -1066,6 +1067,30 @@ class AIAgent:
             self._last_persistence_error = str(e)
             logger.warning("Session DB append failed: %s", e)
             return False
+
+    # ───────────────────────── Fallback（回退）─────────────────────────
+
+    def _try_activate_fallback(
+        self, reason: "FailoverReason | None" = None
+    ) -> bool:
+        """Forwarder — 见 ``agent.chat_completion_helpers.try_activate_fallback``。
+
+        沿 _fallback_chain 切换 provider；链耗尽返回 False。对应原版
+        run_agent.py:6571 的转发器。
+        """
+        from agent.chat_completion_helpers import try_activate_fallback
+
+        return try_activate_fallback(self, reason)
+
+    def _restore_primary_runtime(self) -> bool:
+        """Forwarder — 见 ``agent.agent_runtime_helpers.restore_primary_runtime``。
+
+        每轮开始调用，把上一轮激活的 fallback 恢复回主 provider。对应
+        原版 run_agent.py:6603 的转发器。
+        """
+        from agent.agent_runtime_helpers import restore_primary_runtime
+
+        return restore_primary_runtime(self)
 
     def _reset_activity_labels_after_turn(self) -> None:
         """清理本轮遗留的活动标签（如"压缩中/执行工具中"等展示状态）。

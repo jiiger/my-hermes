@@ -182,15 +182,33 @@ def classify_api_error(
     if status_code is not None:
         if status_code in (401, 403):
             # 认证失败：换凭据/回退，原样重试无意义
-            return ClassifiedError(reason=FailoverReason.auth, status_code=status_code, message=str(error), retryable=False)
+            return ClassifiedError(
+                reason=FailoverReason.auth,
+                status_code=status_code,
+                message=str(error),
+                retryable=False,
+                should_fallback=True,
+            )
         if status_code == 402:
             # 余额不足：立即切换 provider
-            return ClassifiedError(reason=FailoverReason.billing, status_code=status_code, message=str(error), retryable=False)
+            return ClassifiedError(
+                reason=FailoverReason.billing,
+                status_code=status_code,
+                message=str(error),
+                retryable=False,
+                should_fallback=True,
+            )
         if status_code == 429:
             return ClassifiedError(reason=FailoverReason.rate_limit, status_code=status_code, message=str(error))
         if status_code == 404:
             # 模型不存在：换模型/回退
-            return ClassifiedError(reason=FailoverReason.model_not_found, status_code=status_code, message=str(error), retryable=False)
+            return ClassifiedError(
+                reason=FailoverReason.model_not_found,
+                status_code=status_code,
+                message=str(error),
+                retryable=False,
+                should_fallback=True,
+            )
         if status_code == 413:
             return ClassifiedError(
                 reason=FailoverReason.payload_too_large,
@@ -231,9 +249,21 @@ def classify_api_error(
     if _contains_any(msg, _SSL_PATTERNS):
         return ClassifiedError(reason=FailoverReason.ssl_cert_verification, status_code=None, message=str(error))
     if _contains_any(msg, _AUTH_PATTERNS):
-        return ClassifiedError(reason=FailoverReason.auth, status_code=None, message=str(error), retryable=False)
+        return ClassifiedError(
+            reason=FailoverReason.auth,
+            status_code=None,
+            message=str(error),
+            retryable=False,
+            should_fallback=True,
+        )
     if _contains_any(msg, _BILLING_PATTERNS):
-        return ClassifiedError(reason=FailoverReason.billing, status_code=None, message=str(error), retryable=False)
+        return ClassifiedError(
+            reason=FailoverReason.billing,
+            status_code=None,
+            message=str(error),
+            retryable=False,
+            should_fallback=True,
+        )
     if _contains_any(msg, _CONTEXT_PATTERNS):
         return ClassifiedError(
             reason=FailoverReason.context_overflow,
