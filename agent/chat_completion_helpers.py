@@ -70,6 +70,12 @@ def interruptible_api_call(
     if stale_timeout is None:
         stale_timeout = getattr(agent, "_api_stale_timeout", 180.0)
 
+    # Responses API：事件流消费由 codex_runtime 管理（自带 worker + 中断轮询）
+    if getattr(agent, "api_mode", "") == "codex_responses":
+        from agent.codex_runtime import run_codex_stream
+
+        return run_codex_stream(agent, api_kwargs, stale_timeout=stale_timeout)
+
     # worker 结果槽：后台线程写，主线程读（GIL 保证可见性足够）
     result = {"response": None, "error": None}
     # worker 客户端持有者：主线程中断时从这里取 client 并 close
@@ -348,6 +354,17 @@ def interruptible_streaming_api_call(
 
     if stale_timeout is None:
         stale_timeout = getattr(agent, "_api_stale_timeout", 180.0)
+
+    # Responses API：同样走 run_codex_stream（本身即流式事件消费）
+    if getattr(agent, "api_mode", "") == "codex_responses":
+        from agent.codex_runtime import run_codex_stream
+
+        return run_codex_stream(
+            agent,
+            api_kwargs,
+            on_first_delta=on_first_delta,
+            stale_timeout=stale_timeout,
+        )
 
     result = {"response": None, "error": None}
     client_holder = {"client": None}
