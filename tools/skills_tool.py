@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 _PLATFORM_MAP = {"linux": "linux", "darwin": "macos", "win32": "windows"}
 _CURRENT_PLATFORM = _PLATFORM_MAP.get(sys.platform, "linux")
 
-# YAML frontmatter 分隔（必须从文件头开始）
-_FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+# YAML frontmatter 结尾围栏（对齐原版 skill_utils.parse_frontmatter）
+_FRONTMATTER_RE = re.compile(r"\n---\s*\n")
 
 _NAME_MAX = 64
 _DESCRIPTION_MAX = 1024
@@ -50,23 +50,39 @@ def _skills_dir() -> Path:
     return d
 
 
-def _parse_frontmatter(content: str) -> Tuple[Optional[Dict[str, Any]], str]:
+def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     """解析 markdown frontmatter，返回 (dict, body)。
 
-    非法/缺失 frontmatter 返回 (None, 原内容)，不抛异常。
+    对齐原版 skill_utils.parse_frontmatter：
+    - 剥 UTF-8 BOM（Windows 编辑器保存时前置，不剥会导致围栏判定失败）；
+    - YAML 解析失败回退简单 key:value 解析；
+    - 非法/缺失返回空 dict，不抛异常。
     """
     if not content:
-        return None, content
-    m = _FRONTMATTER_RE.match(content)
+        return {}, content
+    if content.startswith("\ufeff"):  # UTF-8 BOM
+        content = content[1:]
+    body = content
+    if not content.startswith("---"):
+        return {}, body
+    m = _FRONTMATTER_RE.search(content[3:])
     if not m:
-        return None, content
+        return {}, body
+    yaml_content = content[3:m.start() + 3]
+    body = content[m.end() + 3:]
+    frontmatter: Dict[str, Any] = {}
     try:
-        data = yaml.safe_load(m.group(1))
-        if not isinstance(data, dict):
-            return None, content
-        return data, content[m.end():]
+        parsed = yaml.safe_load(yaml_content)
+        if isinstance(parsed, dict):
+            frontmatter = parsed
     except Exception:
-        return None, content
+        # Fallback：畸形 YAML 时简单 key:value 解析
+        for line in yaml_content.strip().split("\n"):
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            frontmatter[key.strip()] = value.strip()
+    return frontmatter, body
 
 
 def _normalize_list(value: Any) -> List[str]:
@@ -106,13 +122,57 @@ def _related_skills_of(frontmatter: Dict[str, Any]) -> List[str]:
     return []
 
 
-def _missing_env_vars(frontmatter: Dict[str, Any]) -> List[str]:
-    """prerequisites.env_vars 中当前未设置的环境变量（advisory）。"""
+def _required_env_vars(frontmatter: Dict[str, Any]) -> List[str]:
+    """合并 required_environment_variables（str 或 dict.name，对齐原版）
+    与旧式 prerequisites.env_vars，去重。"""
+    result: List[str] = []
+    seen = set()
+    req_raw = frontmatter.get("required_environment_variables")
+    if isinstance(req_raw, dict):
+        req_raw = [req_raw]
+    if isinstance(req_raw, list):
+        for item in req_raw:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(item.get("name") or item.get("env_var") or "").strip()
+            else:
+                continue
+            if name and name not in seen:
+                seen.add(name)
+                result.append(name)
     prereq = frontmatter.get("prerequisites") or {}
-    envs = []
     if isinstance(prereq, dict):
-        envs = _normalize_list(prereq.get("env_vars"))
-    return [e for e in envs if not os.environ.get(e)]
+        for name in _normalize_list(prereq.get("env_vars")):
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+    return result
+
+
+def _missing_env_vars(frontmatter: Dict[str, Any]) -> List[str]:
+    """当前未设置的环境变量（advisory）。"""
+    return [e for e in _required_env_vars(frontmatter) if not os.environ.get(e)]
+
+
+def _missing_commands(frontmatter: Dict[str, Any]) -> List[str]:
+    """prerequisites.commands 中 PATH 找不到的命令（advisory）。"""
+    import shutil
+
+    prereq = frontmatter.get("prerequisites") or {}
+    commands = []
+    if isinstance(prereq, dict):
+        commands = _normalize_list(prereq.get("commands"))
+    return [c for c in commands if shutil.which(c) is None]
+
+
+def _missing_credential_files(frontmatter: Dict[str, Any]) -> List[str]:
+    """required_credential_files 中不存在的文件（advisory）。"""
+    files = _normalize_list(frontmatter.get("required_credential_files"))
+    return [
+        f for f in files
+        if not Path(os.path.expanduser(f)).exists()
+    ]
 
 
 # ── 查找与安全 ───────────────────────────────────────────────────────
@@ -272,15 +332,27 @@ def skill_view(name: str, file_path: str = None) -> str:
         "category": cat,
         "description": str(fm.get("description") or "")[:_DESCRIPTION_MAX],
         "version": fm.get("version"),
+        "license": fm.get("license"),
+        "compatibility": fm.get("compatibility"),
         "tags": _tags_of(fm),
         "related_skills": _related_skills_of(fm),
         "content": content,
     }
+    for key in ("setup", "environments"):
+        if fm.get(key):
+            result[key] = fm[key]
     missing_env = _missing_env_vars(fm)
+    missing_cmds = _missing_commands(fm)
+    missing_files = _missing_credential_files(fm)
+    notes = []
     if missing_env:
-        result["prerequisites_note"] = (
-            "env vars not set: " + ", ".join(missing_env) + " (advisory)"
-        )
+        notes.append("env vars not set: " + ", ".join(missing_env))
+    if missing_cmds:
+        notes.append("commands not found: " + ", ".join(missing_cmds))
+    if missing_files:
+        notes.append("credential files missing: " + ", ".join(missing_files))
+    if notes:
+        result["prerequisites_note"] = " (advisory); ".join(notes) + " (advisory)"
     return json.dumps(result, ensure_ascii=False)
 
 
