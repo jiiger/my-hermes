@@ -4,10 +4,11 @@ SKILL.md 存储规范（agentskills.io 兼容）、frontmatter 全字段解析�
 （skills_list / skill_view / skill_manage 六动作）、技能索引进 system
 prompt、路径安全全部对齐原版。
 
-裁剪（my-hermes 精简定位）：云端 hub/同步、使用统计（skill_usage）、
-/skill CLI 命令、溯源/静态审计/捆绑包、插件命名空间（ns:skill）、
-external_dirs、disabled 配置、LRU+磁盘快照缓存（skills 少，直接扫描）、
-skill_preprocessing（模板渲染，二期可补）。
+裁剪（my-hermes 精简定位）：云端 hub/同步、/skill CLI 命令、溯源/静态
+审计/捆绑包、插件命名空间（ns:skill）、external_dirs、disabled 配置、
+LRU+磁盘快照缓存（skills 少，直接扫描）、skill_preprocessing（模板渲染，
+二期可补）。使用遥测（skill_usage）与写来源（skill_provenance）已移植，
+供 Curator 自治维护消费。
 
 目录布局（两种均支持）：
   skills/<name>/SKILL.md                 category=None

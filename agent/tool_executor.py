@@ -329,6 +329,13 @@ def execute_tool_calls_sequential(
         if malformed_args_result is not None:
             # my-hermes 契约：参数解析失败按空参执行（与原内联版一致）
             function_args = {}
+        # nudge 重置（对齐原版 tool_executor.py:604-607）：模型主动用了
+        # memory / skill_manage 工具后，重置对应后台提炼节流计数——
+        # "刚用过，不需要再提醒/提炼"。
+        if function_name == "memory":
+            agent._turns_since_memory = 0
+        elif function_name == "skill_manage":
+            agent._iters_since_skill = 0
 
         tool_start_time = time.time()
         tool_impls = getattr(agent, "_tool_impls", {})
