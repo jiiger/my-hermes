@@ -158,8 +158,10 @@ class SessionDB:
             logger.warning("FTS5 unavailable, session search disabled: %s", exc)
         try:
             self._conn.executescript(FTS_TRIGRAM_SQL)
+            self._trigram_available = True
         except sqlite3.Error as exc:
             # trigram 分词器在个别 sqlite 编译期关闭；降级仅影响 CJK 子串索引
+            self._trigram_available = False
             logger.warning("FTS trigram unavailable, CJK substring search disabled: %s", exc)
         # schema 版本簿记（幂等）
         row = self._conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
@@ -808,8 +810,8 @@ class SessionDB:
         """跨会话（或限定会话）全文检索消息（对应原版
         hermes_state_search.py:1410 search_messages 的最小 API）。
 
-        非 CJK 查询走 FTS5 MATCH（BM25 排序）；CJK 查询走 LIKE 子串回退
-        （unicode61 分词会把中文拆成单字，短语匹配不可靠）。
+        非 CJK 查询走 FTS5 MATCH（BM25 排序）；CJK 查询走 trigram 子串
+        索引（分词器不可用时降级 LIKE 全表扫描）。
         默认可见范围 = ``active=1 OR compacted=1``（当前上下文 + 压缩归档
         历史）；只有 rewind/undo（active=0, compacted=0）被排除。
         返回每条消息的 session_id / id / role / content / timestamp / preview。
@@ -823,6 +825,19 @@ class SessionDB:
 
         def _do(conn):
             if self._contains_cjk(sanitized):
+                # CJK 主路径：trigram 子串索引（unicode61 会把中文拆单字，
+                # 短语匹配不可靠）。token 过短（<3 字符）或运行时不可用时
+                # 降级 LIKE 全表扫描（对齐原版 _trigram_eligible_tokens）。
+                if (
+                    getattr(self, "_trigram_available", False)
+                    and self._trigram_eligible_tokens(query)
+                ):
+                    try:
+                        return self._search_trigram(
+                            conn, query, session_id, limit
+                        )
+                    except sqlite3.OperationalError:
+                        pass
                 return self._search_like(conn, query, session_id, limit)
             try:
                 return self._search_fts5(conn, sanitized, session_id, limit)
@@ -831,6 +846,59 @@ class SessionDB:
                 return self._search_like(conn, query, session_id, limit)
 
         return self._execute_read(_do)
+
+    @staticmethod
+    def _trigram_eligible_tokens(query: str) -> bool:
+        """True 当每个非运算符 token 都 ≥3 字符（trigram 可生成索引）。
+
+        trigram 分词器索引 3 字节重叠序列，短 token（如 2 个中文字符）
+        产生不了 trigram，MATCH 恒空——此时应降级 LIKE（对齐原版
+        hermes_state_search.py:1315）。
+        """
+        for tok in query.split():
+            if tok.upper() in {"AND", "OR", "NOT"}:
+                continue
+            if len(tok) < 3:
+                return False
+        return True
+
+    def _search_trigram(
+        self, conn, raw_query: str, session_id: Optional[str], limit: int
+    ) -> List[Dict[str, Any]]:
+        """Trigram 子串检索（对齐原版 hermes_state_search.py:1331
+        _run_trigram_search 的精简版）。
+
+        trigram 分词器索引 3 字节重叠序列，任意子串（含 CJK 短语、粘连在
+        中文旁的拉丁串）都能命中；每个非运算符 token 用引号包裹以中和
+        FTS5 特殊字符。trigram 视图排除了 role='tool' 行（机器噪音），
+        tool 内容检索由调用方按需降级 LIKE 兜底。
+        """
+        parts = []
+        for tok in raw_query.split():
+            if tok.upper() in {"AND", "OR", "NOT"}:
+                parts.append(tok)
+            else:
+                parts.append('"' + tok.replace('"', '""') + '"')
+        trigram_query = " ".join(parts)
+        where = [
+            "messages_fts_trigram MATCH ?",
+            "(m.active = 1 OR m.compacted = 1)",
+        ]
+        params: List[Any] = [trigram_query]
+        if session_id is not None:
+            where.append("m.session_id = ?")
+            params.append(session_id)
+        params.append(limit)
+        rows = conn.execute(
+            f"""SELECT m.id, m.session_id, m.role, m.content, m.timestamp
+                FROM messages_fts_trigram
+                JOIN messages m ON m.id = messages_fts_trigram.rowid
+                WHERE {' AND '.join(where)}
+                ORDER BY m.id DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        return self._shape_search_results(rows)
 
     def _search_fts5(
         self, conn, sanitized_query: str, session_id: Optional[str], limit: int

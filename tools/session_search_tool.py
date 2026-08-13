@@ -24,8 +24,9 @@ from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
 
-# 单条消息正文展示上限（防止超大 tool result 撑爆返回）。
-_MSG_CONTENT_MAX = 2000
+# 单条消息正文展示上限（防止超大 tool result 撑爆返回；检索窗口看大意
+# 足够，细节用 SCROLL 再取）。
+_MSG_CONTENT_MAX = 800
 # READ 模式大会话的截首/截尾条数。
 _READ_HEAD = 20
 _READ_TAIL = 10
@@ -100,7 +101,13 @@ def _discover(db, query: str, limit: int) -> str:
     results = []
     for sid, anchor in seen.items():
         meta = db.get_session(sid) or {}
-        view = db.get_messages_around(sid, anchor["id"], window=5)
+        view = db.get_messages_around(sid, anchor["id"], window=3)
+        # bookend：会话开头/结尾各 3 条 user+assistant，让模型快速判断
+        # "这个会话是干嘛的 / 结论是什么"（对齐原版 discovery bookends）
+        _ua = [
+            m for m in db.get_messages(sid, include_inactive=True)
+            if m.get("role") in ("user", "assistant")
+        ]
         results.append({
             "session_id": sid,
             "source": meta.get("source"),
@@ -108,6 +115,8 @@ def _discover(db, query: str, limit: int) -> str:
             "when": _fmt_ts(meta.get("last_activity_at") or meta.get("started_at")),
             "snippet": anchor.get("preview") or "",
             "match_message_id": anchor["id"],
+            "bookend_start": [_msg_plain(m) for m in _ua[:3]],
+            "bookend_end": [_msg_plain(m) for m in _ua[-3:]],
             "messages": [_msg_plain(m) for m in view["window"]],
             "messages_before": view["messages_before"],
             "messages_after": view["messages_after"],
@@ -262,8 +271,9 @@ SESSION_SEARCH_SCHEMA = {
         "1) DISCOVERY — pass `query`:\n"
         "   session_search(query=\"auth refactor\", limit=3)\n"
         "   Searches across all past sessions and returns the top N matches, "
-        "each with session_id, snippet, and a ±5 message window around the "
-        "matched message.\n\n"
+        "each with session_id, snippet, bookend_start (first 3 user+assistant "
+        "messages: the goal), bookend_end (last 3: the decisions), and a ±3 "
+        "message window around the matched message.\n\n"
         "2) SCROLL — pass `session_id` + `around_message_id`:\n"
         "   session_search(session_id=\"...\", around_message_id=12345, window=10)\n"
         "   Returns a window of ±`window` messages centered on the anchor. "
