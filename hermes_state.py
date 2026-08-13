@@ -678,6 +678,25 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def add_session_call_count(self, session_id: str, count: int) -> None:
+        """累加会话的 API 调用计数（sessions.api_call_count）。
+
+        最小版统计（对齐原版 update_token_counts 的 api_call_count 语义，
+        但以轮为单位一次性累加；原版是每 API 入队后台写）。后期完整移植
+        usage 记账体系后由 queue_token_counts/update_token_counts 取代。
+        """
+        if not count:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET api_call_count = "
+                "COALESCE(api_call_count, 0) + ? WHERE id = ?",
+                (int(count), session_id),
+            )
+
+        self._execute_write(_do)
+
     def archive_and_compact(
         self,
         session_id: str,

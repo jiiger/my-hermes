@@ -571,6 +571,19 @@ def run_conversation(
             agent._session_messages = messages
         except Exception:
             agent._incremental_persistence_failed = True
+        # API 调用计数统计（最小版，对齐原版 update_token_counts 的
+        # api_call_count 语义）：每轮一次性把本轮的 API 调用次数累加写库。
+        # 原版是每次 API 调用后 queue_token_counts 入队、后台线程写；
+        # my-hermes 裁剪了 usage 记账体系，先以轮为单位补统计（后期完整
+        # 移植 usage 后由 queue/update_token_counts 取代本段）。
+        if api_call_count and getattr(agent, "_session_db", None) \
+                and getattr(agent, "session_id", None):
+            try:
+                agent._session_db.add_session_call_count(
+                    agent.session_id, api_call_count
+                )
+            except Exception:
+                pass
 
     # 循环自然退出（没拿到最终回答、也没中断/失败）→ 只能是预算或
     # 迭代次数耗尽，归一化为 budget_exhausted（对应原版 finalize_turn）

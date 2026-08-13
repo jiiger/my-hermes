@@ -971,15 +971,6 @@ class AIAgent:
                 if not self._session_db_created:
                     return False  # 创建失败，等待下次 flush 重试
 
-            current_session_id = getattr(self, "session_id", None)
-            flushed_session_id = getattr(self, "_flushed_db_message_session_id", None)
-            if flushed_session_id != current_session_id or self._last_flushed_db_idx == 0:
-                seed_ids = set()
-            else:
-                seed_ids = getattr(self, "_flushed_db_message_ids", None)
-                if not isinstance(seed_ids, set):
-                    seed_ids = set()
-            self._flushed_db_message_session_id = current_session_id
             history_ids = {
                 id(item)
                 for item in (conversation_history or [])
@@ -1008,8 +999,8 @@ class AIAgent:
                     continue
                 if msg.get(_DB_PERSISTED_MARKER):
                     continue
-                # 已在历史/种子里的消息：视为已持久化，盖章跳过
-                if id(msg) in history_ids or id(msg) in seed_ids:
+                # 已在历史里的消息：视为已持久化，盖章跳过
+                if id(msg) in history_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
                 role = msg.get("role", "unknown")
@@ -1061,8 +1052,6 @@ class AIAgent:
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
-            self._flushed_db_message_ids = set()
-            self._last_flushed_db_idx = len(messages)
             self._db_flush_scan_prefix = messages[:]
             self._incremental_persistence_failed = False
             return True
