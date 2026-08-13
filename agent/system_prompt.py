@@ -190,6 +190,18 @@ def build_system_prompt_parts(
         except Exception:
             pass
 
+    # 3½ 技能索引（程序记忆目录，对齐原版 system_prompt.py:299-327）：
+    #   有 skills 工具时注入；空 skills 目录返回空串跳过。
+    if "skills_list" in agent.valid_tool_names:
+        try:
+            from tools.skills_tool import build_skills_system_prompt
+
+            _skills_block = build_skills_system_prompt()
+            if _skills_block:
+                volatile_parts.append(_skills_block)
+        except Exception:
+            pass
+
     from hermes_time import now as _hermes_now
 
     now = _hermes_now()

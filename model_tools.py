@@ -30,6 +30,7 @@ _TOOL_MODULES = [
     "tools.terminal_tool",
     "tools.memory_tool",
     "tools.session_search_tool",
+    "tools.skills_tool",
 ]
 
 # Phase 1 工具名的展示顺序（与 _TOOL_MODULES 一一对应）。
@@ -44,6 +45,9 @@ _TOOL_ORDER = [
     "terminal",
     "memory",
     "session_search",
+    "skills_list",
+    "skill_view",
+    "skill_manage",
 ]
 
 _tools_loaded = False
