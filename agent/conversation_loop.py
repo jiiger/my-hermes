@@ -139,7 +139,7 @@ def run_conversation(
     # 中间旁白交付"（interim_assistant_callback 去重推送）尚未移植——
     # 本属性占位，待 interim 交付实现后激活（对齐原版 run_agent.py:6313）。
     agent._delivered_interim_texts = set()
-    # 增量持久化失败标记（配置的 SessionDB 追加失败只影响本轮；精简版暂无 DB）
+    # 增量持久化失败标记（SessionDB 追加失败只影响本轮，下次 flush 重试）
     agent._incremental_persistence_failed = False
     # 当前 user 消息已入列：API 调用前先落库一次（也保证压缩前原始历史
     # 已持久化，压缩后重建的消息不会重复写入）。
@@ -181,6 +181,31 @@ def run_conversation(
             # ①½ 主动压缩检查：上一轮 API 响应后已 update_from_response，
             #    这里用真实用量判定是否超阈值；命中则压缩消息历史后重新组装。
             _compressor = getattr(agent, "context_compressor", None)
+            # 主动工具结果剪枝（对齐原版 conversation_loop.py:6930）：大窗口
+            # 模型远在压缩阈值前回收旧 tool result 的重发成本。确定性、无
+            # LLM 调用；未配置 proactive_prune_tokens 或回收量不达标时 no-op
+            # （返回原对象）。剪枝会重写已发送历史 → 使 flush 前缀快照失效，
+            # 下次 flush 全量重扫。
+            _prune = getattr(_compressor, "prune_tool_results_only", None)
+            if callable(_prune):
+                try:
+                    _pruned_msgs, _pruned_n = _prune(
+                        messages,
+                        current_tokens=getattr(
+                            _compressor, "last_prompt_tokens", None
+                        ),
+                    )
+                    if _pruned_n and _pruned_msgs is not None and _pruned_msgs is not messages:
+                        messages = _pruned_msgs
+                        # 剪枝已 archive_and_compact 持久化：把 flush baseline
+                        # 同步为剪枝后列表（对齐压缩后
+                        # conversation_history_after_compression 的语义）。
+                        # 否则压缩重建出的无 marker 消息在浅拷贝后既不在
+                        # history_ids 也无 marker，会被 flush 重复 INSERT。
+                        conversation_history = list(_pruned_msgs)
+                        agent._db_flush_scan_prefix = None
+                except Exception:
+                    pass  # 剪枝失败不阻断回合
             if _compressor is not None and _compressor.should_compress():
                 if not agent._interrupt_requested:
                     # 压缩编排层：内部完成压缩前记忆通知、引擎调用、失败回滚、

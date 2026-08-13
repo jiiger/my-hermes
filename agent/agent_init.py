@@ -435,9 +435,9 @@ def init_agent(
     # ⑫½½ SessionDB（情节记忆）状态初始化（对应原版 agent_init.py 的
     # session_db 接入；本任务移植最小版）
     # ══════════════════════════════════════════════════════════════
-    # 调用方显式传入 session_db → 使用它，agent 不拥有、close 不关闭；
-    # 未传入 → 惰性创建（_get_session_db_for_recall 或首次 flush 时才
-    # 打开数据库，import/init 阶段绝不触碰磁盘）。
+    # 调用方显式传入 session_db（CLI/gateway 创建并注入）→ 使用它，
+    # agent 不拥有、close 不关闭；未传入 → 惰性创建（_get_session_db_for_recall
+    # 兜底；import/init 阶段绝不触碰磁盘）。
     if session_db is not None:
         agent._session_db = session_db
         agent._owns_session_db = False
@@ -454,12 +454,10 @@ def init_agent(
     # 增量持久化失败标记与最近错误（写失败返回 False 时置位）
     agent._incremental_persistence_failed = False
     agent._last_persistence_error = None
-    # flush 去重状态：一次性 id 种子 + 已冲刷前缀快照（对应原版
-    # _flushed_db_message_ids / _db_flush_scan_prefix）
-    agent._flushed_db_message_ids = set()
-    agent._last_flushed_db_idx = 0
+    # flush 去重状态：已冲刷前缀快照（对应原版 _db_flush_scan_prefix；
+    # 原版一次性 id 种子 _flushed_db_message_ids 由压缩轮换/恢复的外部调用方
+    # 填充，my-hermes 恒 in-place 无填充方，已裁剪）
     agent._db_flush_scan_prefix = None
-    agent._flushed_db_message_session_id = None
     # close() 兜底 flush 时使用的最新消息快照（由对话循环收尾写入）
     agent._session_messages = None
 
@@ -591,6 +589,17 @@ def init_agent(
             _summary_api_key = os.getenv(_summary_key_env) if _summary_key_env else ""
             # 绝对 token 上限（compression.threshold_tokens）与按模型阈值覆盖
             _threshold_tokens_cap = _safe_int_comp(_comp_cfg.get("threshold_tokens"))
+            # 主动工具结果剪枝参数（对齐原版 agent_init.py:1999-2008 解析；
+            # 未配置/非法值时回落构造器默认：0 = 关闭 / 8000 / 4096）
+            _prune_tokens = _safe_int_comp(_comp_cfg.get("proactive_prune_tokens")) or 0
+            _prune_min_chars = (
+                _safe_int_comp(_comp_cfg.get("proactive_prune_min_result_chars"))
+                or 8000
+            )
+            _prune_min_reclaim = (
+                _safe_int_comp(_comp_cfg.get("proactive_prune_min_reclaim_tokens"))
+                or 4096
+            )
             _model_thresholds_cfg = _comp_cfg.get("model_thresholds") or {}
             if not isinstance(_model_thresholds_cfg, dict):
                 _model_thresholds_cfg = {}
@@ -631,10 +640,17 @@ def init_agent(
                 max_tokens=getattr(agent, "max_tokens", None),
                 threshold_tokens_cap=_threshold_tokens_cap,
                 model_thresholds=_model_thresholds_cfg,
+                proactive_prune_tokens=_prune_tokens,
+                proactive_prune_min_result_chars=_prune_min_chars,
+                proactive_prune_min_reclaim_tokens=_prune_min_reclaim,
                 min_tail_user_messages=int(_comp_cfg.get("min_tail_user_messages", 1)),
                 agent=agent,
                 summary_client_factory=_summary_client_factory if _summary_model else None,
             )
+            # 剪枝提交时持久化绑定（对齐原版 agent_init.py:2560 bind_session_state）
+            if getattr(agent, "_session_db", None) is not None:
+                agent.context_compressor._session_db = agent._session_db
+                agent.context_compressor._session_id = agent.session_id
         except Exception as exc:  # 压缩挂载失败不阻断启动
             logger.warning("Context compressor mount failed: %s", exc)
             agent.context_compressor = None

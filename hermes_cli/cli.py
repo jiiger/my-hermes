@@ -711,12 +711,26 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         sys.exit(1)
 
+    # 情节记忆：创建 SQLite 会话存储并注入 agent（对应原版 cli.py 的
+    # _session_db 初始化 + cli_agent_setup_mixin.py 的注入）。失败不阻断
+    # 启动，但明确告知持久化/恢复/搜索不可用。
+    session_db = None
+    try:
+        from hermes_state import SessionDB
+
+        session_db = SessionDB()
+    except Exception as _db_exc:
+        print(
+            f"⚠ Session store 不可用：本次对话不会落库、无法恢复、搜索禁用（{_db_exc}）"
+        )
+
     try:
         agent = AIAgent(
             api_key=api_key,
             base_url=base_url,
             model=model,
             provider=provider,
+            session_db=session_db,
         )
     except RuntimeError as exc:
         print(f"❌ Agent 初始化失败: {exc}")

@@ -39,6 +39,9 @@ _PRUNE_MIN_CHARS = 200
 _FALLBACK_TURN_MAX_CHARS = 700
 _MAX_TAIL_MESSAGE_FLOOR = 8
 _FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
+# 小上下文阈值下限（对齐原版 context_compressor.py:819-820）
+_SMALL_CTX_WINDOW_LIMIT = 512_000
+_SMALL_CTX_THRESHOLD_PERCENT = 0.75
 
 _SUMMARY_END_MARKER = (
     "--- END OF CONTEXT SUMMARY — "
@@ -302,6 +305,10 @@ class ContextCompressor(ContextEngine):
 
         # 阈值 tokens（含 max_tokens 输出预留；cap 限制）
         self._threshold_tokens_cap = _safe_int(threshold_tokens_cap)
+        # 小上下文阈值下限（<512K 抬到 ≥0.75，raise-only；对齐原版 :1769/1797）
+        self.threshold_percent = self._effective_threshold_percent(
+            self.context_length, self.threshold_percent
+        )
         self.threshold_tokens = self._compute_threshold_tokens(
             self.context_length, self.threshold_percent, self.max_tokens
         )
@@ -314,10 +321,20 @@ class ContextCompressor(ContextEngine):
             _SUMMARY_TOKENS_CEILING,
         )
 
-        # 工具结果预修剪参数（主动修剪触发，my-hermes 暂只在压缩内使用）
+        # 工具结果预修剪参数（主动修剪触发；门控逻辑见 prune_tool_results_only）
         self.proactive_prune_tokens = proactive_prune_tokens or 0
-        self.proactive_prune_min_result_chars = proactive_prune_min_result_chars
-        self.proactive_prune_min_reclaim_tokens = proactive_prune_min_reclaim_tokens
+        self.proactive_prune_min_result_chars = (
+            proactive_prune_min_result_chars or 8000
+        )
+        self.proactive_prune_min_reclaim_tokens = (
+            proactive_prune_min_reclaim_tokens or 4096
+        )
+        # 剪枝冷却低水位（内存态，对齐原版 model_config 持久化的简化：
+        # my-hermes 的 archive_and_compact 忽略 model_config_patch）
+        self._proactive_prune_rearm_tokens = 0
+        # 剪枝提交时持久化用（由 agent_init 挂载后绑定）
+        self._session_db = None
+        self._session_id = ""
 
         # 运行状态
         self.last_prompt_tokens = 0
@@ -392,8 +409,19 @@ class ContextCompressor(ContextEngine):
                 self._threshold_tokens, self._threshold_tokens_cap
             )
 
-    def _effective_threshold_percent(self, context_length: int, threshold_percent: float) -> float:
-        """小上下文模型不提前压缩：阈值下限 64K 场景特殊处理。"""
+    @staticmethod
+    def _effective_threshold_percent(
+        context_length: int, threshold_percent: float,
+    ) -> float:
+        """小上下文阈值下限（raise-only，对齐原版 :2456-2464）。
+
+        窗口 < ``_SMALL_CTX_WINDOW_LIMIT``（512K）的模型触发阈值不低于
+        ``_SMALL_CTX_THRESHOLD_PERCENT``（75%）；显式更高的值（用户配置或
+        按模型自动抬升）永远优先——只抬低值。512K+ 保持配置值（默认 50%
+        已留足压缩后余量）。
+        """
+        if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
+            return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
         return threshold_percent
 
     def _compute_threshold_tokens(
@@ -535,12 +563,66 @@ class ContextCompressor(ContextEngine):
     def prune_tool_results_only(
         self, messages: List[Dict[str, Any]], current_tokens: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
-        """只剪旧工具结果（对齐原版 :3391）。"""
-        return self._prune_old_tool_results(
+        """确定性、无 LLM 的工具结果剪枝（对齐原版 :3391 的门控）。
+
+        大窗口模型上 should_compress()（≈50% 窗口）几乎不触发，旧 tool
+        result 会每轮原样重发；此方法在远低于压缩阈值时提前回收它们。
+        保护最近 protect_last_n 条（按消息数，不用 tail_token_budget——
+        后者由 50% 阈值推导，大窗口下会保护整个会话、剪不掉任何东西）。
+
+        PROMPT-CACHE 契约：提交剪枝会重写模型已见过的消息体，从最早被
+        改写处起缓存前缀失效——与压缩边界相同。因此只有回收量达到
+        proactive_prune_min_reclaim_tokens 才提交，并冷却到消息历史重新
+        长出一个完整触发量（runway）后才允许再次剪枝。任一门槛未过时
+        返回**输入对象本身**（调用方以 ``result is not input`` 判定 no-op）。
+
+        提交时用 archive_and_compact 把剪枝结果作为新 active 集持久化
+        （对齐原版）；rearm 低水位仅内存态（my-hermes 无 model_config
+        持久化列）。
+        """
+        if self.proactive_prune_tokens <= 0:
+            return messages, 0
+        if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
+            return messages, 0
+        if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
+            return messages, 0
+        before = sum(_estimate_msg_budget_tokens(m) for m in messages)
+        if before < self._proactive_prune_rearm_tokens:
+            return messages, 0
+
+        pruned_msgs, pruned_count = self._prune_old_tool_results(
             messages,
             protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
+            protect_tail_tokens=None,
+            min_prune_chars=self.proactive_prune_min_result_chars,
         )
+        if not pruned_count:
+            return messages, 0
+
+        # 实测回收量门槛（prompt-cache 滞后）：按真实 before/after 估算，
+        # dedup + 参数截断的收益也计入。
+        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+        reclaimed = max(0, before - after)
+        if reclaimed < self.proactive_prune_min_reclaim_tokens:
+            return messages, 0
+
+        # 冷却：等历史重新长出完整触发量才允许下一次缓存破坏式重写。
+        runway = max(
+            reclaimed,
+            self.proactive_prune_tokens,
+            self.proactive_prune_min_reclaim_tokens,
+        )
+        self._proactive_prune_rearm_tokens = after + runway
+
+        # 持久化：把剪枝结果作为新 active 集提交（与内存一致）。
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "") or ""
+        if session_db is not None and session_id:
+            try:
+                session_db.archive_and_compact(session_id, pruned_msgs)
+            except Exception as exc:
+                logger.warning("Proactive prune persist failed: %s", exc)
+        return pruned_msgs, pruned_count
 
     # -- 摘要生成 --------------------------------------------------------
 

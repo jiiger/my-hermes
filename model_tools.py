@@ -29,6 +29,7 @@ _TOOL_MODULES = [
     "tools.file_tools",
     "tools.terminal_tool",
     "tools.memory_tool",
+    "tools.session_search_tool",
 ]
 
 # Phase 1 工具名的展示顺序（与 _TOOL_MODULES 一一对应）。
@@ -42,6 +43,7 @@ _TOOL_ORDER = [
     "search_files",
     "terminal",
     "memory",
+    "session_search",
 ]
 
 _tools_loaded = False

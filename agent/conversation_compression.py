@@ -229,11 +229,13 @@ def compress_context(
         agent._compression_feasibility_checked = True
 
     # 3. in-place 压缩（原版 config compression.in_place，默认 True）。
-    #    my-hermes 无 SessionDB，天然恒 in-place（不轮换 session_id）。
+    #    my-hermes 恒 in-place（不轮换 session_id），提交见下方 7½
+    #    archive_and_compact（软归档旧 active + 重建 active 集）。
     in_place = bool(getattr(agent, "compression_in_place", True))
 
     # TODO 原版在此：SessionDB 压缩锁获取 / 锁刷新 / 会话恢复 / 采用
-    #     live child（my-hermes 无 SessionDB，DB 接入后在此补锁与恢复）。
+    #     live child。my-hermes 恒 in-place 无需轮换；压缩锁与恢复未补，
+    #     archive_and_compact 单事务提交已保证 DB 一致性。
 
     # 4. 压缩前：外部 memory provider 提取洞见（预留扩展点）。
     #    原版 :2825 on_pre_compress——provider 从即将被丢弃的消息里提取
@@ -341,7 +343,6 @@ def compress_context(
                 compressed,
             )
             agent._last_compaction_in_place = True
-            agent._flushed_db_message_ids = set()
         except BaseException as _db_exc:
             # DB 提交失败：回滚内存消息与 attempt 状态，保持"压缩未发生"
             # 语义——不改变 DB 的 active/inactive 状态、不更新 baseline、

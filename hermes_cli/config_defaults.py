@@ -635,7 +635,10 @@ DEFAULT_CONFIG = {
         # for a full trigger-sized token runway to
         # regrow before rearming. Keeps prompt-cache
         # breaks episodic. 0 = no minimum-savings gate.
-        "micro_compact": False,  # opt-in: after each completed turn, fold the
+        "micro_compact": False,  # ⚠ my-hermes 未实现：原版
+        # context_compressor._micro_compact（滚动摘要）未移植，配置仅作
+        # 原版对齐文档保留，设为 true 无任何效果。原版语义：
+        # after each completed turn, fold the
         # oldest un-absorbed exchange into a rolling
         # summary, amortizing compression cost instead
         # of paying it in one batch stall. Default False

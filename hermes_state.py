@@ -27,7 +27,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_state_common import (
+    DEFERRED_INDEX_SQL,
     FTS_SQL,
+    FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
     _FTS5_SPECIAL_RE,
@@ -36,6 +38,59 @@ from hermes_state_common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ── 旧库升级迁移：SCHEMA_SQL 已含全部列，这些清单只用于给"上一版最小
+#    库"补列（ALTER TABLE ADD COLUMN），保证老库打开后与原版结构一致。──
+_SESSIONS_UPGRADE_COLUMNS = [
+    ("origin_json", "TEXT"),
+    ("expiry_finalized", "INTEGER DEFAULT 0"),
+    ("model_config", "TEXT"),
+    ("system_prompt_hash", "TEXT"),
+    ("parent_session_id", "TEXT"),
+    ("input_tokens", "INTEGER DEFAULT 0"),
+    ("output_tokens", "INTEGER DEFAULT 0"),
+    ("cache_read_tokens", "INTEGER DEFAULT 0"),
+    ("cache_write_tokens", "INTEGER DEFAULT 0"),
+    ("reasoning_tokens", "INTEGER DEFAULT 0"),
+    ("cwd", "TEXT"),
+    ("git_branch", "TEXT"),
+    ("git_repo_root", "TEXT"),
+    ("billing_provider", "TEXT"),
+    ("billing_base_url", "TEXT"),
+    ("billing_mode", "TEXT"),
+    ("estimated_cost_usd", "REAL"),
+    ("actual_cost_usd", "REAL"),
+    ("cost_status", "TEXT"),
+    ("cost_source", "TEXT"),
+    ("pricing_version", "TEXT"),
+    ("title", "TEXT"),
+    ("title_source", "TEXT"),
+    ("last_activity_description", "TEXT"),
+    ("last_activity_provenance", "TEXT"),
+    ("handoff_state", "TEXT"),
+    ("handoff_platform", "TEXT"),
+    ("handoff_error", "TEXT"),
+    ("compression_failure_cooldown_until", "REAL"),
+    ("compression_failure_error", "TEXT"),
+    ("compression_fallback_streak", "INTEGER NOT NULL DEFAULT 0"),
+    ("compression_ineffective_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("profile_name", "TEXT"),
+    ("rewind_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("archived", "INTEGER NOT NULL DEFAULT 0"),
+    ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_read_at", "REAL"),
+]
+
+_MESSAGES_UPGRADE_COLUMNS = [
+    ("effect_disposition", "TEXT"),
+    ("token_count", "INTEGER"),
+    ("reasoning_details", "TEXT"),
+    ("codex_reasoning_items", "TEXT"),
+    ("codex_message_items", "TEXT"),
+    ("platform_message_id", "TEXT"),
+    ("observed", "INTEGER DEFAULT 0"),
+]
 
 
 def _system_prompt_hash(system_prompt: str) -> str:
@@ -82,15 +137,30 @@ class SessionDB:
             pass
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
-        # 幂等建表：可重复打开同一数据库
-        self._conn.executescript(SCHEMA_SQL)
-        # 列迁移：旧库（无 active/compacted 列）升级时补齐，旧行视为 active
+        # 幂等建表：可重复打开同一数据库。旧最小库缺列时（SCHEMA_SQL 里的
+        # 索引/外键引用新列）先补列再重试，避免 "no such column"。
+        try:
+            self._conn.executescript(SCHEMA_SQL)
+        except sqlite3.OperationalError:
+            self._reconcile_columns()
+            self._conn.executescript(SCHEMA_SQL)
+        # 列迁移：旧最小库升级时补齐到原版全列（旧行按默认值处理）
         self._reconcile_columns()
+        # 引用后加列的索引（active/compacted 等）在补列之后创建（原版语义）
+        try:
+            self._conn.executescript(DEFERRED_INDEX_SQL)
+        except sqlite3.Error as exc:
+            logger.warning("Deferred index creation failed: %s", exc)
         try:
             self._conn.executescript(FTS_SQL)
         except sqlite3.Error as exc:
             # FTS5 不可用（编译期关闭）时降级：消息写入不受影响，仅搜索不可用
             logger.warning("FTS5 unavailable, session search disabled: %s", exc)
+        try:
+            self._conn.executescript(FTS_TRIGRAM_SQL)
+        except sqlite3.Error as exc:
+            # trigram 分词器在个别 sqlite 编译期关闭；降级仅影响 CJK 子串索引
+            logger.warning("FTS trigram unavailable, CJK substring search disabled: %s", exc)
         # schema 版本簿记（幂等）
         row = self._conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is None:
@@ -100,20 +170,35 @@ class SessionDB:
             self._conn.commit()
 
     def _reconcile_columns(self) -> None:
-        """补齐旧库缺失的 active / compacted 列（对应原版 schema 迁移的
-        最小实现：PRAGMA 检查 + ALTER TABLE ADD COLUMN）。
+        """补齐旧库缺失列到原版全字段（PRAGMA 检查 + ALTER TABLE ADD COLUMN）。
 
-        上一版最小 SessionDB 没有这两列；升级时补上，并把存量行视为
-        active=1（历史对话仍是当前工作上下文，直到首次压缩才被归档）。
+        SCHEMA_SQL 新库已含全部列；本方法只处理"上一版最小库"升级：
+        逐表检查缺失列并补齐（含 active/compacted），存量行按默认值处理
+        （历史消息视为 active=1，直到首次压缩才被归档）。
         """
-        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(messages)")}
         with self._conn:
-            if "active" not in cols:
+            for table, columns in (
+                ("messages", _MESSAGES_UPGRADE_COLUMNS),
+                ("sessions", _SESSIONS_UPGRADE_COLUMNS),
+            ):
+                cols = {
+                    r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")
+                }
+                for name, ddl in columns:
+                    if name not in cols:
+                        self._conn.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"
+                        )
+            # 上一版最小库遗留的 active/compacted 补列（历史原因，幂等）
+            mcols = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(messages)")
+            }
+            if "active" not in mcols:
                 self._conn.execute(
                     "ALTER TABLE messages ADD COLUMN "
                     "active INTEGER NOT NULL DEFAULT 1"
                 )
-            if "compacted" not in cols:
+            if "compacted" not in mcols:
                 self._conn.execute(
                     "ALTER TABLE messages ADD COLUMN "
                     "compacted INTEGER NOT NULL DEFAULT 0"
@@ -197,20 +282,23 @@ class SessionDB:
     # ───────────────────────── 会话 ─────────────────────────
 
     @staticmethod
-    def _store_system_prompt(conn, system_prompt: Optional[str]) -> None:
-        """把系统提示快照写入 system_prompts 表（hash 去重）。"""
+    def _store_system_prompt(conn, system_prompt: Optional[str]) -> Optional[str]:
+        """把系统提示快照写入 system_prompts 表（hash 去重），返回 hash。"""
         if system_prompt is None:
-            return
+            return None
+        _hash = _system_prompt_hash(system_prompt)
         conn.execute(
             "INSERT OR IGNORE INTO system_prompts (hash, prompt) VALUES (?, ?)",
-            (_system_prompt_hash(system_prompt), _scrub_surrogates(system_prompt)),
+            (_hash, _scrub_surrogates(system_prompt)),
         )
+        return _hash
 
     def _insert_session_row(
         self,
         session_id: str,
         source: str,
         model: str = None,
+        model_config: Dict[str, Any] = None,
         system_prompt: str = None,
         user_id: str = None,
         session_key: Optional[str] = None,
@@ -218,33 +306,57 @@ class SessionDB:
         chat_type: str = None,
         thread_id: str = None,
         display_name: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        git_repo_root: str = None,
+        origin_json: str = None,
         **kwargs,
     ) -> None:
         """插入会话行；已存在时幂等补全仍为 NULL 的字段（对应原版
         hermes_state.py:3499 _insert_session_row 的 COALESCE 语义）。
 
-        原版还处理 parent/cwd/profile 继承、model_config 等，最小版裁剪。
+        字段集与 SCHEMA_SQL 对齐：parent_session_id / cwd / profile_name /
+        git_repo_root / origin_json / model_config 均可选存储；其余
+        原版扩展字段（billing/title/handoff 等）由上层按需 UPDATE。
         """
-        del kwargs  # 原版额外参数（parent_session_id/cwd/profile_name/...）最小版不存储
+        del kwargs  # 其余未知参数忽略
 
         def _do(conn):
+            system_prompt_hash = None
             if system_prompt is not None:
-                self._store_system_prompt(conn, system_prompt)
+                system_prompt_hash = self._store_system_prompt(
+                    conn, system_prompt
+                )
+            model_config_json = (
+                json.dumps(model_config, ensure_ascii=False)
+                if isinstance(model_config, dict) and model_config
+                else None
+            )
             conn.execute(
                 """INSERT INTO sessions (
                        id, source, user_id, session_key, chat_id, chat_type,
-                       thread_id, display_name, model, system_prompt, started_at
+                       thread_id, display_name, origin_json, model, model_config,
+                       system_prompt, system_prompt_hash, parent_session_id,
+                       cwd, profile_name, git_repo_root, started_at
                    )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
+                       model_config = COALESCE(sessions.model_config, excluded.model_config),
                        system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
+                       system_prompt_hash = COALESCE(sessions.system_prompt_hash, excluded.system_prompt_hash),
                        user_id = COALESCE(sessions.user_id, excluded.user_id),
                        session_key = COALESCE(sessions.session_key, excluded.session_key),
                        chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
                        chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
-                       display_name = COALESCE(sessions.display_name, excluded.display_name)""",
+                       display_name = COALESCE(sessions.display_name, excluded.display_name),
+                       origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
+                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                       cwd = COALESCE(sessions.cwd, excluded.cwd),
+                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
+                       git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
                 (
                     session_id,
                     source,
@@ -254,8 +366,15 @@ class SessionDB:
                     chat_type,
                     thread_id,
                     display_name,
+                    origin_json,
                     model,
+                    model_config_json,
                     system_prompt,
+                    system_prompt_hash,
+                    parent_session_id,
+                    cwd,
+                    profile_name,
+                    git_repo_root,
                     time.time(),
                 ),
             )
@@ -305,14 +424,16 @@ class SessionDB:
         def _do(conn):
             if system_prompt is None:
                 conn.execute(
-                    "UPDATE sessions SET system_prompt = NULL WHERE id = ?",
+                    "UPDATE sessions SET system_prompt = NULL, "
+                    "system_prompt_hash = NULL WHERE id = ?",
                     (session_id,),
                 )
                 return
-            self._store_system_prompt(conn, system_prompt)
+            _hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
-                "UPDATE sessions SET system_prompt = ? WHERE id = ?",
-                (_scrub_surrogates(system_prompt), session_id),
+                "UPDATE sessions SET system_prompt = ?, system_prompt_hash = ? "
+                "WHERE id = ?",
+                (_scrub_surrogates(system_prompt), _hash, session_id),
             )
 
         self._execute_write(_do)
@@ -458,11 +579,15 @@ class SessionDB:
             conn.execute(
                 """INSERT INTO messages (
                        session_id, role, content, tool_call_id, tool_calls,
-                       tool_name, timestamp, finish_reason, reasoning,
-                       reasoning_content, api_content, display_kind,
-                       display_metadata, active, compacted
+                       tool_name, effect_disposition, timestamp, token_count,
+                       finish_reason, reasoning, reasoning_content,
+                       reasoning_details, codex_reasoning_items,
+                       codex_message_items, platform_message_id, observed,
+                       api_content, display_kind, display_metadata,
+                       active, compacted
                    )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -470,12 +595,29 @@ class SessionDB:
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
+                    _scrub_surrogates(msg.get("effect_disposition"))
+                    if isinstance(msg.get("effect_disposition"), str)
+                    else None,
                     message_timestamp,
+                    msg.get("token_count"),
                     msg.get("finish_reason"),
                     _scrub_surrogates(msg.get("reasoning")) if role == "assistant" else None,
                     _scrub_surrogates(msg.get("reasoning_content"))
                     if role == "assistant"
                     else None,
+                    _scrub_surrogates(msg.get("reasoning_details"))
+                    if role == "assistant"
+                    else None,
+                    _scrub_surrogates(msg.get("codex_reasoning_items"))
+                    if isinstance(msg.get("codex_reasoning_items"), str)
+                    else None,
+                    _scrub_surrogates(msg.get("codex_message_items"))
+                    if isinstance(msg.get("codex_message_items"), str)
+                    else None,
+                    _scrub_surrogates(msg.get("platform_message_id"))
+                    if isinstance(msg.get("platform_message_id"), str)
+                    else None,
+                    1 if msg.get("observed") else 0,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind"))
                     if isinstance(msg.get("display_kind"), str)
@@ -715,6 +857,75 @@ class SessionDB:
             params,
         ).fetchall()
         return self._shape_search_results(rows)
+
+    def get_messages_around(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+    ) -> Dict[str, Any]:
+        """以某条消息 id 为锚点取窗口（对齐原版 hermes_state.py:8300 精简版）。
+
+        返回 {"window": [消息...], "messages_before": n, "messages_after": n}，
+        window 内消息按 id 升序。around_message_id 不在该会话时返回空窗口。
+        供 session_search 的 DISCOVERY（锚定 FTS 命中）与 SCROLL（任意锚点）
+        两种模式使用；messages_before/after 用于判断会话边界。
+        """
+        if window < 0:
+            window = 0
+
+        def _do(conn):
+            anchor_exists = conn.execute(
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                (around_message_id, session_id),
+            ).fetchone()
+            if not anchor_exists:
+                return {"window": [], "messages_before": 0, "messages_after": 0}
+            before_rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND id <= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, around_message_id, window + 1),
+            ).fetchall()
+            after_rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, around_message_id, window),
+            ).fetchall()
+            rows = list(reversed(before_rows)) + list(after_rows)
+            result = []
+            for row in rows:
+                msg = dict(row)
+                if "content" in msg:
+                    msg["content"] = self._decode_content(msg["content"])
+                if msg.get("tool_calls"):
+                    try:
+                        msg["tool_calls"] = json.loads(msg["tool_calls"])
+                    except (json.JSONDecodeError, TypeError):
+                        msg["tool_calls"] = None
+                result.append(msg)
+            return {
+                "window": result,
+                "messages_before": max(0, len(before_rows) - 1),
+                "messages_after": len(after_rows),
+            }
+
+        return self._execute_read(_do)
+
+    def list_sessions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """按最近活动列出会话（供 session_search 的 BROWSE 模式）。"""
+        limit = max(1, min(int(limit or 20), 200))
+
+        def _do(conn):
+            return conn.execute(
+                "SELECT id, source, model, started_at, ended_at, end_reason, "
+                "message_count, tool_call_count, last_activity_at "
+                "FROM sessions "
+                "ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        rows = self._execute_read(_do)
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _shape_search_results(rows) -> List[Dict[str, Any]]:
