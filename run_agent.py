@@ -1138,13 +1138,33 @@ class AIAgent:
                 _session_db.close()
         except Exception:
             pass
-        # 外部记忆 provider 关闭（原有逻辑保留）
+        # 外部记忆 provider 会话收尾（对齐原版 shutdown_memory_provider）：
+        # 先 on_session_end（会话末提取，如 holographic auto_extract），
+        # 再 shutdown_all（有界排空 + 逆序关闭）。
+        self.shutdown_memory_provider(_session_messages)
+
+    def shutdown_memory_provider(self, messages: list = None) -> None:
+        """会话边界关闭外部记忆 provider（对齐原版 run_agent.py:4121）。
+
+        调用 MemoryManager.on_session_end（会话末提取）然后 shutdown_all
+        （有界排空 + 逆序关闭）。只在真正的会话边界调用（CLI 退出、/new
+        轮换等），NOT 每轮——每轮 shutdown 会杀掉 provider。
+        """
         _mm = getattr(self, "_memory_manager", None)
-        if _mm is not None:
-            try:
-                _mm.shutdown_all()
-            except Exception:
-                pass
+        if _mm is None:
+            return
+        try:
+            _mm.on_session_end(messages or [])
+        except Exception as exc:
+            logger.warning(
+                "Memory provider on_session_end failed during shutdown: %s",
+                exc,
+                exc_info=True,
+            )
+        try:
+            _mm.shutdown_all()
+        except Exception:
+            pass
 
 
 def main(
