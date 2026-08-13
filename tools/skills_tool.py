@@ -27,6 +27,8 @@ import yaml
 
 from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
+from tools.skill_provenance import get_write_origin
+from tools import skill_usage as _usage
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +299,15 @@ def skills_list(category: str = None) -> str:
     }, ensure_ascii=False)
 
 
+def _record_activity(name: str) -> None:
+    """skill 被使用/写入时记遥测（best-effort，不阻断工具）。"""
+    try:
+        _usage.seed_record_if_missing(name, created_by=get_write_origin())
+        _usage.bump_use(name)
+    except Exception:
+        pass
+
+
 # ── 工具：skill_view（tier 2-3 全文）────────────────────────────────
 
 def skill_view(name: str, file_path: str = None) -> str:
@@ -353,6 +364,7 @@ def skill_view(name: str, file_path: str = None) -> str:
         notes.append("credential files missing: " + ", ".join(missing_files))
     if notes:
         result["prerequisites_note"] = " (advisory); ".join(notes) + " (advisory)"
+    _record_activity(sname)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -387,17 +399,23 @@ def skill_manage(
         return tool_error(err)
     name = name.strip()
 
-    if action == "create":
-        return _manage_create(name, content, category, description)
-    if action == "edit":
-        return _manage_edit(name, content)
-    if action == "patch":
-        return _manage_patch(name, old_string, new_string, replace_all)
-    if action == "delete":
-        return _manage_delete(name)
-    if action == "write_file":
-        return _manage_write_file(name, file_path, content)
-    return _manage_remove_file(name, file_path)
+    _handlers = {
+        "create": lambda: _manage_create(name, content, category, description),
+        "edit": lambda: _manage_edit(name, content),
+        "patch": lambda: _manage_patch(name, old_string, new_string, replace_all),
+        "delete": lambda: _manage_delete(name),
+        "write_file": lambda: _manage_write_file(name, file_path, content),
+        "remove_file": lambda: _manage_remove_file(name, file_path),
+    }
+    _res = _handlers[action]()
+    # 写动作成功后记录遥测（delete 除外——已删 skill 无需记录）
+    if action != "delete":
+        try:
+            if json.loads(_res).get("success"):
+                _record_activity(name)
+        except Exception:
+            pass
+    return _res
 
 
 def _manage_create(name, content, category, description) -> str:

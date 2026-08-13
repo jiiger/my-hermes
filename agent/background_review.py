@@ -293,6 +293,13 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
+        # 标记写来源：本线程内 skill_manage 的写入视为 agent 自主沉淀
+        # （curator 只整理这些；用户写的一律不动——对齐原版 provenance）。
+        try:
+            from tools.skill_provenance import set_write_origin
+            set_write_origin("background_review")
+        except Exception:
+            pass
         _fork_review_agent(agent, messages_snapshot, prompt)
 
     return _target, prompt

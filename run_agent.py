@@ -1152,6 +1152,13 @@ class AIAgent:
         # 先 on_session_end（会话末提取，如 holographic auto_extract），
         # 再 shutdown_all（有界排空 + 逆序关闭）。
         self.shutdown_memory_provider(_session_messages)
+        # Skill Curator 自治维护（会话边界跑一次确定性 inactivity prune，
+        # best-effort；curator.enabled=false 或未配置时 no-op）。
+        try:
+            from agent.curator import maybe_run_curator
+            maybe_run_curator()
+        except Exception:
+            pass
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """会话边界关闭外部记忆 provider（对齐原版 run_agent.py:4121）。
