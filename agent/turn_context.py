@@ -159,6 +159,20 @@ def build_turn_context(
             except Exception:
                 pass
 
+    # 后台记忆提炼触发（对齐原版 turn_context.py:684-692）：memory 工具
+    # 启用且每 N 轮（memory.nudge_interval）触发一次；回合后由
+    # conversation_loop 据此 spawn background review。
+    should_review_memory = False
+    if (
+        getattr(agent, "_memory_nudge_interval", 0) > 0
+        and "memory" in getattr(agent, "valid_tool_names", set())
+        and getattr(agent, "_memory_store", None)
+    ):
+        agent._turns_since_memory = getattr(agent, "_turns_since_memory", 0) + 1
+        if agent._turns_since_memory >= agent._memory_nudge_interval:
+            should_review_memory = True
+            agent._turns_since_memory = 0
+
     # 任务 / 轮次 ID：调用方没传任务ID就现场生成
     effective_task_id = task_id or str(uuid.uuid4())
     turn_id = str(uuid.uuid4())
@@ -203,5 +217,6 @@ def build_turn_context(
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
         ext_prefetch_cache=ext_prefetch_cache,
+        should_review_memory=should_review_memory,
     )
 

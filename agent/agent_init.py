@@ -454,6 +454,24 @@ def init_agent(
     # 增量持久化失败标记与最近错误（写失败返回 False 时置位）
     agent._incremental_persistence_failed = False
     agent._last_persistence_error = None
+    # 后台记忆/技能提炼节流（对齐原版 agent_init.py:1698/1798）：
+    # memory.nudge_interval / skills.creation_nudge_interval，默认 10 轮。
+    # 0 = 关闭对应提炼。计数在 turn_context/收尾处递增。
+    try:
+        from hermes_cli.config import load_config_readonly
+        _review_cfg = load_config_readonly()
+        _mem_nudge = int((_review_cfg.get("memory", None) or {}).get(
+            "nudge_interval", 10))
+        _skill_nudge = int((_review_cfg.get("skills", None) or {}).get(
+            "creation_nudge_interval", 10))
+    except Exception:
+        _mem_nudge, _skill_nudge = 10, 10
+    agent._memory_nudge_interval = max(0, _mem_nudge)
+    agent._skill_nudge_interval = max(0, _skill_nudge)
+    agent._turns_since_memory = 0
+    agent._iters_since_skill = 0
+    agent._background_review_agent = None
+    agent._background_review_lock = threading.Lock()
     # flush 去重状态：已冲刷前缀快照（对应原版 _db_flush_scan_prefix；
     # 原版一次性 id 种子 _flushed_db_message_ids 由压缩轮换/恢复的外部调用方
     # 填充，my-hermes 恒 in-place 无填充方，已裁剪）

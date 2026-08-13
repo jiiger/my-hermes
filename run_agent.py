@@ -962,6 +962,10 @@ class AIAgent:
         写失败返回 False 并置位 _incremental_persistence_failed 与
         _last_persistence_error；下一次 flush 重新扫描（前缀快照清空）。
         """
+        # 持久化隔离（对齐原版）：background review fork 等代理绝不能写进
+        # 用户真实会话——硬阻断所有 DB 触达路径。
+        if getattr(self, "_persist_disabled", False):
+            return None
         if not self._session_db:
             return None
         try:
@@ -1125,7 +1129,13 @@ class AIAgent:
         # ② 终结会话行（幂等；已结束则 no-op）
         _session_db = getattr(self, "_session_db", None)
         try:
-            if _session_db is not None and getattr(self, "session_id", None):
+            if (
+                _session_db is not None
+                and getattr(self, "session_id", None)
+                # fork 单生命周期：review agent 共享父 session_id，
+                # close 不终结父会话行（对齐原版 _end_session_on_close）
+                and getattr(self, "_end_session_on_close", True)
+            ):
                 _session_db.end_session(
                     getattr(self, "session_id"), "agent_close"
                 )
@@ -1165,6 +1175,38 @@ class AIAgent:
             _mm.shutdown_all()
         except Exception:
             pass
+
+    def _spawn_background_review(
+        self,
+        messages_snapshot: List[Dict],
+        review_memory: bool = False,
+        review_skills: bool = False,
+        focus: Optional[str] = None,
+    ) -> None:
+        """Spawn 后台记忆/技能提炼线程（对齐原版 run_agent.py:1801）。
+
+        在回复交付后运行，绝不与用户任务竞争模型注意力；best-effort，
+        失败不影响主对话。daemon 线程由 fork 的 review agent 执行。
+        """
+        try:
+            from agent.background_review import spawn_background_review_thread
+            from tools.thread_context import propagate_context_to_thread
+
+            target, _prompt = spawn_background_review_thread(
+                self,
+                messages_snapshot,
+                review_memory=review_memory,
+                review_skills=review_skills,
+                focus=focus,
+            )
+            t = threading.Thread(
+                target=propagate_context_to_thread(target),
+                daemon=True,
+                name="bg-review",
+            )
+            t.start()
+        except Exception:
+            pass  # Background review is best-effort
 
 
 def main(

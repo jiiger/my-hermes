@@ -615,6 +615,38 @@ def run_conversation(
         except Exception:
             pass  # 外部记忆是 best-effort，失败不阻断回合收尾
 
+    # ══════════════════════════════════════════════════════════════
+    # 后台记忆/技能提炼（对齐原版 turn_finalizer.py:733-765）：
+    #   回复交付后 spawn background review，绝不与用户任务竞争。
+    #   memory 触发由 turn_context 计算（每 N 轮）；skill 触发按累计
+    #   tool 迭代数（_iters_since_skill += 本轮迭代）达阈值。
+    # ══════════════════════════════════════════════════════════════
+    _should_review_skills = False
+    if (
+        getattr(agent, "_skill_nudge_interval", 0) > 0
+        and "skill_manage" in getattr(agent, "valid_tool_names", set())
+    ):
+        agent._iters_since_skill = (
+            getattr(agent, "_iters_since_skill", 0) + api_call_count
+        )
+        if agent._iters_since_skill >= agent._skill_nudge_interval:
+            _should_review_skills = True
+            agent._iters_since_skill = 0
+
+    if (
+        final_response
+        and not interrupted
+        and (_should_review_memory or _should_review_skills)
+    ):
+        try:
+            agent._spawn_background_review(
+                messages_snapshot=list(messages),
+                review_memory=_should_review_memory,
+                review_skills=_should_review_skills,
+            )
+        except Exception:
+            pass  # Background review is best-effort
+
     # turn 结束时消费中断标志（对应原版 turn_finalizer.py:693 的
     # clear_interrupt()）。这样用户的一次中断只影响当前轮，不会
     # 污染下一轮对话。
