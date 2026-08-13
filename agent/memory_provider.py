@@ -44,10 +44,12 @@ logger = logging.getLogger(__name__)
 # （"k8s"、"yolo"、"note"、"hindsight"）不会误匹配，而带尾随标点的变体
 # （"hi!"、"hey."、"thanks :)"、"done???"）会。
 TRIVIAL_PROMPT_RE = re.compile(
-    r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
-    r'hi|hey|hello|yo|sup|'
-    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
-    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
+    r"^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|"
+    r"hi|hey|hello|yo|sup|"
+    r"continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)"
+    r'[\s!?.:;,"'
+    + "'"
+    + r"~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$",
     re.IGNORECASE,
 )
 
@@ -166,7 +168,9 @@ class MemoryProvider(ABC):
         必须返回 JSON 字符串（工具结果）。只对 get_tool_schemas() 返回的
         工具名调用。
         """
-        raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
+        raise NotImplementedError(
+            f"Provider {self.name} does not handle tool {tool_name}"
+        )
 
     def shutdown(self) -> None:
         """干净关闭——冲刷队列、关闭连接。"""

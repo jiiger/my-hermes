@@ -207,6 +207,8 @@ my_hermes.egg-info
 
 # Test files are local-only (user decision)
 tests/
+# L5 性能测试（可选，独立目录，不随默认 pytest 收集）
+tests_perf/
 
 # 覆盖率数据（pytest-cov 构建产物）
 .coverage
