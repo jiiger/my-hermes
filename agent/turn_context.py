@@ -4,6 +4,7 @@
 session DB、上下文压缩预检、插件钩子、记忆提醒等，只保留核心组装。
 """
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from typing import Any, Dict, List, Optional
 
 from agent.iteration_budget import IterationBudget
 from tools.interrupt import set_interrupt
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,6 +80,29 @@ def build_turn_context(
     # 主循环的流式分支（interruptible_streaming_api_call）会逐增量触发它
     if stream_callback is not None:
         agent._stream_callback = stream_callback
+
+    # Between-turns MCP 刷新（对齐原版 agent/turn_context.py:509）：
+    # 上一轮之后才连上的 MCP server（慢 HTTP/npx/uvx 冷启动通常 2-6s，
+    # 错过 agent 构建前的有界等待）在本轮快照里落地。本轮 tools= 前缀
+    # 尚未组装，刷新只扩展全新请求前缀，缓存安全。无 MCP 时 no-op。
+    # import-cost 门：tools.mcp_tool 会拉进整个 mcp 包（实测 ~0.4s），
+    # 零 MCP server 配置的用户首轮不该走重导入路径——MCP 工具只能由
+    # 已 import tools.mcp_tool 的代码注册，若它不在 sys.modules 就没有
+    # 可刷新的东西，直接跳过。
+    try:
+        if not getattr(agent, "_skip_mcp_refresh", False):
+            import sys as _sys
+
+            if "tools.mcp_tool" in _sys.modules:
+                from tools.mcp_tool import (
+                    has_registered_mcp_tools,
+                    refresh_agent_mcp_tools,
+                )
+
+                if has_registered_mcp_tools():
+                    refresh_agent_mcp_tools(agent, quiet_mode=True)
+    except Exception:
+        logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
     # 净化用户消息：去掉孤立代理对字符，防止下游编码错误
     user_message = sanitize_surrogates(user_message)

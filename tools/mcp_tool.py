@@ -1907,6 +1907,78 @@ def get_registered_mcp_server_names() -> Set[str]:
         }
 
 
+def refresh_agent_mcp_tools(
+    agent,
+    *,
+    enabled_override=None,
+    disabled_override=None,
+    quiet_mode: bool = True,
+) -> set:
+    """按当前 registry 重建 agent 的工具快照（对应原版 :7130 精简版）。
+
+    agent 在构建时快照一次 ``agent.tools`` 就不再读 registry；后台 MCP
+    发现慢于构建时，server 连接后其工具对模型不可见。本函数是唯一共享
+    的刷新入口：每回合 between-turns 刷新（turn_context）都调它。
+
+    my-hermes 精简点（对照原版）：
+    - 原版的 ``_reinject_post_build_tools``（memory-provider / context-engine
+      工具）未移植，无需重注入；
+    - 无 ``_agent_tools_lock`` / ``_tool_snapshot_generation``（原版防两个
+      并发刷新互相覆盖）；my-hermes 刷新只发生在对话循环线程，后台线程
+      只写 registry（registry 自带锁），不存在并发发布竞争。
+
+    尊重 agent 构建时的 enabled_toolsets / disabled_toolsets（同一个
+    过滤）；按工具**名** diff（数量比较会漏掉等量换入换出）。无变化时
+    不触碰快照（避免无谓 churn）。返回新增工具名集合（空 = 无变化）。
+    """
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    if enabled_override is not None or disabled_override is not None:
+        enabled = (
+            enabled_override
+            if enabled_override is not None
+            else getattr(agent, "enabled_toolsets", None)
+        )
+        disabled = (
+            disabled_override
+            if disabled_override is not None
+            else getattr(agent, "disabled_toolsets", None)
+        )
+        agent.enabled_toolsets = enabled
+        agent.disabled_toolsets = disabled
+    else:
+        enabled = getattr(agent, "enabled_toolsets", None)
+        disabled = getattr(agent, "disabled_toolsets", None)
+
+    new_defs = list(
+        get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=quiet_mode,
+        )
+        or []
+    )
+    new_names = {t["function"]["name"] for t in new_defs}
+
+    current = {
+        t["function"]["name"]
+        for t in (getattr(agent, "tools", None) or [])
+    }
+    if new_names == current:
+        # 无变化 → 不触碰快照（无 churn）
+        return set()
+
+    # 原子发布：tools / valid_tool_names / _tool_impls 一起换，避免
+    # 并发读者看到跨属性半换（对话循环单线程，主要是防御性一致）。
+    agent.tools = new_defs
+    agent.valid_tool_names = new_names
+    agent._tool_impls = {
+        entry.name: entry.handler for entry in registry.iter_entries()
+    }
+    return new_names - current
+
+
 def shutdown_mcp_servers() -> None:
     """关闭所有 MCP server 并停止后台 loop（对应原版 :7321 精简）。"""
     with _lock:
@@ -1949,11 +2021,10 @@ __all__ = [
     "get_mcp_status",
     "has_registered_mcp_tools",
     "get_registered_mcp_server_names",
+    "refresh_agent_mcp_tools",
     "mcp_prefixed_tool_name",
     "sanitize_mcp_name_component",
 ]
-
-
 
 
 

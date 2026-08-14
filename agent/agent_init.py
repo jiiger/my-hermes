@@ -414,6 +414,28 @@ def init_agent(
     # 函数内 import 避免循环导入（model_tools → tools.* → tools.registry）
     from model_tools import build_tool_impls_map, get_tool_definitions
 
+    # ══════════════════════════════════════════════════════════════
+    # ⑪½ MCP 后台发现 + 有界等待（方案 C，对齐原版 mcp_startup）：
+    #    连接/发现放到 daemon 后台线程（可能耗时数十秒），这里只 join
+    #    至多 mcp_discovery_timeout（默认 1.5s，快 server 即时返回）；
+    #    错过窗口的 server 由每回合 between-turns 刷新
+    #    （refresh_agent_mcp_tools，见 agent/turn_context.py）自动补进
+    #    工具快照。启动永远不被 MCP 阻塞。
+    # ══════════════════════════════════════════════════════════════
+    try:
+        from hermes_cli.mcp_startup import (
+            ensure_mcp_discovery_before_agent_build,
+        )
+
+        ensure_mcp_discovery_before_agent_build(
+            logger=logger, thread_name="agent-init-mcp-discovery"
+        )
+    except Exception:
+        pass
+    # 每回合 MCP 快照刷新开关（对齐原版 agent_init.py:930；turn_context
+    # 检查它，测试/特殊路径可置 True 跳过刷新）。
+    agent._skip_mcp_refresh = False
+
     agent.tools = get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
@@ -427,35 +449,17 @@ def init_agent(
     )  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
 
     # ══════════════════════════════════════════════════════════════
-    # ⑪½ MCP 工具发现（对应原版 discover_mcp_tools，Phase 1 移植）
-    #    读 config.yaml 的 mcp_servers → 后台 loop 连接 → 发现并注册
-    #    → 把 mcp_* 工具合并进 agent.tools / valid_tool_names /
-    #    _tool_impls（仿照 ⑫½ provider 工具合并模式；MCP 工具注册在
-    #    tools.registry，handler 由 mcp_tool 生成，经 _tool_impls 派发）。
+    # ⑪½½ MCP 工具快照补齐（对齐原版 refresh_agent_mcp_tools 语义）：
+    #    把有界等待窗口内已注册的 MCP 工具合入 agent.tools / valid_tool_names
+    #    / _tool_impls（按名 diff，无变化 no-op）。此后每回合 turn_context
+    #    会再次刷新，慢 server 连接完成后自动补上。
     # ══════════════════════════════════════════════════════════════
     try:
-        from tools.mcp_tool import (
-            discover_mcp_tools,
-            get_registered_mcp_server_names,
-        )
-        from tools.registry import registry
+        from tools.mcp_tool import refresh_agent_mcp_tools
 
-        discover_mcp_tools()
-        for _server_name in sorted(get_registered_mcp_server_names()):
-            _toolset = f"mcp-{_server_name}"
-            for _tname in registry.get_tool_names_for_toolset(_toolset):
-                if _tname in agent.valid_tool_names:
-                    continue
-                _entry = registry.get_entry(_tname)
-                if _entry is None:
-                    continue
-                agent.tools.append(
-                    {"type": "function", "function": _entry.schema}
-                )
-                agent.valid_tool_names.add(_tname)
-                agent._tool_impls[_tname] = _entry.handler
+        refresh_agent_mcp_tools(agent)
     except Exception as _mcp_e:
-        logger.warning("MCP tool discovery failed: %s", _mcp_e)
+        logger.warning("MCP tool refresh failed: %s", _mcp_e)
 
     # 内置记忆（MEMORY.md + USER.md）——按原版 agent_init.py:1707-1725 精简。
     # 内置记忆是独立线，不经 MemoryManager（原版亦如此）；_memory_manager
