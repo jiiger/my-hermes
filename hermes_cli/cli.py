@@ -878,6 +878,18 @@ def create_agent_from_env() -> AIAgent:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    # 初始化集中式日志（对齐原版 hermes_cli/main.py:751-753）：交互/单次
+    # 对话启动即写 agent.log + errors.log；WARNING/ERROR 进文件而非终端
+    # stderr（否则 Python 日志兜底 lastResort 会把 WARNING 直接打到终端）。
+    # 日志初始化失败不阻断启动（原版仅捕获 ImportError，这里放宽为
+    # Exception 以覆盖 mkdir 权限等运行时错误）。
+    try:
+        from hermes_logging import setup_logging as _setup_logging
+
+        _setup_logging(mode="cli")
+    except Exception:
+        pass
+
     # argparse 解析（对应原版 hermes_cli/main.py 的 argparse 体系）：
     # --help 在任何凭据检查之前由 argparse 处理并 SystemExit(0)，
     # 因此帮助信息不依赖 API 凭据。

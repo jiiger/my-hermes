@@ -82,6 +82,17 @@ def build_top_level_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> None:
     """唯一入口：解析 argv → 分发子命令（对齐原版 main() 语义）。"""
+    # 初始化集中式日志（对齐原版 hermes_cli/main.py:751-753）：所有子命令
+    # 启动即写 agent.log + errors.log；WARNING/ERROR 进文件而非终端 stderr。
+    # 日志初始化失败不阻断启动（原版仅捕获 ImportError，这里放宽为
+    # Exception 以覆盖 mkdir 权限等运行时错误）。
+    try:
+        from hermes_logging import setup_logging as _setup_logging
+
+        _setup_logging(mode="cli")
+    except Exception:
+        pass
+
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # 默认 chat：第一个 token 不是已知子命令 / 帮助选项时，视为 query
