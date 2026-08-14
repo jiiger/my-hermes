@@ -97,12 +97,17 @@ def _is_destructive_command(cmd: str) -> bool:
 
 
 def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
-    """判断 MCP 工具是否可并行（精简版恒返回 False）。
+    """判断 MCP 工具是否可并行（对应原版懒加载 tools.mcp_tool）。
 
-    原版懒加载 tools.mcp_tool.is_mcp_tool_parallel_safe；my-hermes 没有
-    MCP 系统，直接返回 False（未知工具不并行）。
+    按 server 的 ``supports_parallel_tool_calls`` 配置决定；my-hermes 已
+    移植 tools.mcp_tool，这里懒加载避免与 MCP 模块形成导入环。
     """
-    return False
+    try:
+        from tools.mcp_tool import is_mcp_tool_parallel_safe as _impl
+
+        return _impl(tool_name)
+    except Exception:
+        return False
 
 
 def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> List[tuple]:

@@ -403,6 +403,11 @@ exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
 # sealed venv is missing hermes_constants, run_agent, etc.
+# NOTE (my-hermes 2026-08-14): 列表已对齐 my-hermes 实际存在的顶层模块。
+# 原版其余 11 个（toolsets/batch_runner/trajectory_compressor/toolset_distributions/
+# cli/hermes_bootstrap/hermes_state_portability/hermes_state_schema/
+# hermes_state_search/hermes_logging/mcp_serve）未移植，声明会导致
+# `uv build` 报 "module not found"，已删除。
 py-modules = [
     "run_agent",
     "model_tools",

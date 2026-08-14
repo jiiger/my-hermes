@@ -73,6 +73,10 @@ class ToolRegistry:
         # 注册表：{工具名: ToolEntry}。Python dict 保持插入顺序，
         # get_definitions 按注册顺序返回（冒烟测试期望的顺序）。
         self._tools: Dict[str, ToolEntry] = {}
+        # toolset 别名映射：{别名: 真实 toolset}（对应原版 registry.py:487
+        # register_toolset_alias；MCP 用它把 server 名注册为 mcp-{server}
+        # toolset 的别名，供按 server 名查询工具）。
+        self._toolset_aliases: Dict[str, str] = {}
         # 读写锁：工具模块在 import 时注册、运行期只读查询，
         # 用 RLock 让并发读取拿到稳定快照。
         self._lock = threading.RLock()
@@ -191,6 +195,31 @@ class ToolRegistry:
                 entry.name for entry in self._tools.values()
                 if entry.toolset == toolset
             )
+
+    # ------------------------------------------------------------------
+    # Toolset aliases
+    # ------------------------------------------------------------------
+
+    def register_toolset_alias(self, alias: str, toolset: str) -> None:
+        """注册 toolset 别名（对应原版 registry.py:487）。
+
+        别名指向真实 toolset，供按别名查询工具（如 MCP server 名 → 其
+        ``mcp-{server}`` toolset）。幂等：重复注册直接覆盖。
+        """
+        with self._lock:
+            self._toolset_aliases[alias] = toolset
+
+    def get_toolset_for_alias(self, alias: str) -> Optional[str]:
+        """返回别名指向的 toolset（未注册返回 None）。"""
+        with self._lock:
+            return self._toolset_aliases.get(alias)
+
+    def get_tool_names_for_alias(self, alias: str) -> List[str]:
+        """返回别名下所有工具名（按 toolset 查询，未注册返回空列表）。"""
+        toolset = self.get_toolset_for_alias(alias)
+        if not toolset:
+            return []
+        return self.get_tool_names_for_toolset(toolset)
 
     # ------------------------------------------------------------------
     # Schema retrieval

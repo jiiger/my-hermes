@@ -425,6 +425,38 @@ def init_agent(
     agent._tool_impls = (
         build_tool_impls_map()
     )  # {工具名: 实现函数}，供 _execute_tool_calls 查找执行
+
+    # ══════════════════════════════════════════════════════════════
+    # ⑪½ MCP 工具发现（对应原版 discover_mcp_tools，Phase 1 移植）
+    #    读 config.yaml 的 mcp_servers → 后台 loop 连接 → 发现并注册
+    #    → 把 mcp_* 工具合并进 agent.tools / valid_tool_names /
+    #    _tool_impls（仿照 ⑫½ provider 工具合并模式；MCP 工具注册在
+    #    tools.registry，handler 由 mcp_tool 生成，经 _tool_impls 派发）。
+    # ══════════════════════════════════════════════════════════════
+    try:
+        from tools.mcp_tool import (
+            discover_mcp_tools,
+            get_registered_mcp_server_names,
+        )
+        from tools.registry import registry
+
+        discover_mcp_tools()
+        for _server_name in sorted(get_registered_mcp_server_names()):
+            _toolset = f"mcp-{_server_name}"
+            for _tname in registry.get_tool_names_for_toolset(_toolset):
+                if _tname in agent.valid_tool_names:
+                    continue
+                _entry = registry.get_entry(_tname)
+                if _entry is None:
+                    continue
+                agent.tools.append(
+                    {"type": "function", "function": _entry.schema}
+                )
+                agent.valid_tool_names.add(_tname)
+                agent._tool_impls[_tname] = _entry.handler
+    except Exception as _mcp_e:
+        logger.warning("MCP tool discovery failed: %s", _mcp_e)
+
     # 内置记忆（MEMORY.md + USER.md）——按原版 agent_init.py:1707-1725 精简。
     # 内置记忆是独立线，不经 MemoryManager（原版亦如此）；_memory_manager
     # 仅用于外部 provider，在 ⑫½（session 生成后）激活。

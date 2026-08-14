@@ -520,6 +520,10 @@ DEFAULT_CONFIG = {
     "mcp_single_query_discovery_timeout": 15.0,
     # MCP runtime behavior (distinct from the per-server definitions in
     # mcp_servers: and from the auxiliary.mcp side-LLM task settings).
+    # NOTE (my-hermes 2026-08-14): 死配置键——原版 CLI 文件 watcher
+    # （config.yaml 变更热重载 + /reload-mcp 命令，原版 cli.py）未移植，
+    # 本键无消费者，设置不生效。保留以对齐原版 config 结构，Phase 2
+    # 移植 watcher 时激活。
     "mcp": {
         # Auto-reload MCP connections when config.yaml's mcp_servers section
         # changes at runtime (CLI file watcher, default on).
@@ -1708,6 +1712,9 @@ DEFAULT_CONFIG = {
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
+        # NOTE (my-hermes 2026-08-14): 死配置键——原版 delegate_task 的
+        # toolsets 继承逻辑（子代理工具集收窄时保留父级 MCP toolset）未移植
+        # （toolsets.py 不存在），本键无消费者，设置不生效。保留对齐原版结构。
         "inherit_mcp_toolsets": True,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
         # independent of the parent's max_iterations)

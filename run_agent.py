@@ -1271,6 +1271,13 @@ class AIAgent:
             maybe_run_curator()
         except Exception:
             pass
+        # MCP server 连接收尾：关闭全部 stdio/HTTP 连接并停后台 loop
+        # （对齐原版 run_agent 关闭时的 shutdown_mcp_servers）。
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except Exception:
+            pass
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """会话边界关闭外部记忆 provider（对齐原版 run_agent.py:4121）。
@@ -1372,7 +1379,18 @@ def main(
     print(f"\n User Query : {user_query}")
     print("\n" + "=" * 50)
 
-    result = agent.run_conversation(user_query)
+    try:
+        result = agent.run_conversation(user_query)
+    finally:
+        # 清理收尾：对齐原版"入口层负责关闭"的职责划分（原版 cli.py:1200-1201
+        # / hermes_cli/main.py:165-166 在入口处调 shutdown_mcp_servers；my-hermes
+        # 无 CLI 层，standalone main 即唯一入口，在此补 finally）。
+        # close() 内含：MCP server 关闭（shutdown_mcp_servers）、会话 DB 关闭、
+        # 记忆 provider 收尾。异常路径（run_conversation 抛错）同样执行。
+        try:
+            agent.close()
+        except Exception as _cleanup_exc:
+            print(f"⚠️ Cleanup failed: {_cleanup_exc}")
 
     if result["final_response"]:
         print("\n🎯 FINAL RESPONSE:")
