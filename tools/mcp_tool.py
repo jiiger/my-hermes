@@ -35,6 +35,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -453,6 +454,56 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple:
     return command, env
 
 
+# ── MCP 子进程 stderr 重定向（对齐原版 :138-200）────────────────────────
+# MCP SDK 的 stdio_client(server, errlog=sys.stderr) 默认把子进程 stderr
+# 接到父进程真实 stderr（用户 TTY）。FastMCP banner、context7 等启动横幅
+# 会直接写到终端——交互界面渲染时破坏显示，看起来像"自动输入到输入栏"。
+# 这里重定向到共享日志文件 ~/.hermes/logs/mcp-stderr.log（按 server 名打
+# 时间戳标记），保留下日志可查。
+_mcp_stderr_log_fh: Optional[Any] = None
+_mcp_stderr_log_lock = threading.Lock()
+
+
+def _get_mcp_stderr_log() -> Any:
+    """返回共享 append 模式文件句柄（进程内复用，所有 stdio server 共用）。
+
+    必须有真实 OS 文件描述符（fileno()）——asyncio subprocess 把子进程
+    stderr 直接接到该 fd。打开失败回退 os.devnull，再失败回退真实 stderr。
+    """
+    global _mcp_stderr_log_fh
+    with _mcp_stderr_log_lock:
+        if _mcp_stderr_log_fh is not None:
+            return _mcp_stderr_log_fh
+        try:
+            from hermes_constants import get_hermes_home
+
+            log_dir = get_hermes_home() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "mcp-stderr.log"
+            # 行缓冲让 server 输出及时落盘；errors=replace 容忍乱码输出。
+            fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+            fh.fileno()  # 确认有真实 fd
+            _mcp_stderr_log_fh = fh
+        except Exception as exc:
+            logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)
+            try:
+                _mcp_stderr_log_fh = open(os.devnull, "w", encoding="utf-8")
+            except Exception:
+                _mcp_stderr_log_fh = sys.stderr  # 最后兜底：原行为
+        return _mcp_stderr_log_fh
+
+
+def _write_stderr_log_header(server_name: str) -> None:
+    """spawn 前写人类可读的会话标记（在共享日志文件里定位各 server 输出）。"""
+    fh = _get_mcp_stderr_log()
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        fh.write(f"\n===== [{ts}] starting MCP server '{server_name}' =====\n")
+        fh.flush()
+    except Exception:
+        pass
+
+
 # ── 工具描述注入扫描（对应原版 :593-638）─────────────────────────────────
 
 # MCP 工具描述里的 prompt injection 模式。WARNING 级：只记日志不拦截
@@ -811,7 +862,16 @@ class MCPServerTask:
         )
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
 
-        async with stdio_client(server_params) as (read_stream, write_stream):
+        # 子进程 stderr 重定向到共享日志文件（对齐原版）：SDK 默认把
+        # stderr 接到用户 TTY，MCP server 的启动横幅（context7/FastMCP）
+        # 会直接打到终端/输入栏。重定向后 ~/.hermes/logs/mcp-stderr.log
+        # 仍可查各 server 日志。
+        _write_stderr_log_header(self.name)
+        _errlog = _get_mcp_stderr_log()
+        async with stdio_client(server_params, errlog=_errlog) as (
+            read_stream,
+            write_stream,
+        ):
             async with ClientSession(read_stream, write_stream) as session:
                 self.session = session
                 self.initialize_result = await asyncio.wait_for(
@@ -2025,6 +2085,4 @@ __all__ = [
     "mcp_prefixed_tool_name",
     "sanitize_mcp_name_component",
 ]
-
-
 
