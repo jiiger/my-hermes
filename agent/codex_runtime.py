@@ -5,17 +5,22 @@ responses_adapter._normalize_codex_response 归一化成 chat 兼容对象
 （choices[0].message + usage），主循环/工具循环/fallback 无需区分来源。
 
 精简差异（相对原版 codex_runtime.py）：
-- 不移植 relay_llm 观测、单写者围栏、断流续跑（重试）、commentary 展示；
+- 不移植 relay_llm 观测、单写者围栏、commentary 展示；
+- 断流续跑（重试）已移植：transport 类错误（连接断开/读超时）在
+  ``run_codex_stream`` 内自动重试一次（对齐原版 max_stream_retries=1）；
 - 推理 delta 不推送展示（my-hermes 无推理显示通道），但完整 reasoning
   item 仍经 output_item.done 收集，交给归一化保留；
 - 中断模式对齐 chat_completion_helpers：后台线程消费事件流，主线程
   轮询中断/stale 并关闭 client。
 """
 
+import logging
 import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ── 事件字段读取（兼容 SDK 对象与 dict 两种形态）──────────────────────
@@ -45,6 +50,22 @@ _TERMINAL_EVENT_TYPES = {
     "response.incomplete",
     "response.failed",
 }
+
+
+def _transport_error_types() -> tuple:
+    """transport 类异常集合：断流/连接断开/读超时（可重试）。
+
+    对齐原版 codex_runtime.run_codex_stream 的重试捕获集合
+    （httpx.RemoteProtocolError / ReadTimeout / ConnectError + ConnectionError）。
+    """
+    import httpx as _httpx
+
+    return (
+        _httpx.RemoteProtocolError,
+        _httpx.ReadTimeout,
+        _httpx.ConnectError,
+        ConnectionError,
+    )
 
 
 def _consume_codex_event_stream(
@@ -214,6 +235,7 @@ def _map_usage(usage: Any) -> Optional[SimpleNamespace]:
 def run_codex_stream(
     agent,
     api_kwargs: dict,
+    client: Any = None,
     *,
     on_first_delta: Optional[Callable[[], None]] = None,
     stale_timeout: Optional[float] = None,
@@ -224,6 +246,20 @@ def run_codex_stream(
     主线程轮询中断/stale 并关闭 client。返回对象形状与非流式
     ``response.choices[0].message`` 一致（content / tool_calls /
     finish_reason / usage），主循环无需区分来源。
+
+    断流续跑（对齐原版 run_codex_stream 的 max_stream_retries=1）：
+    - 打开事件流失败（连接建立阶段的 transport 错误）→ 重试一次；
+    - 消费事件流中途断流（transport 错误）→ 重试一次；
+    - 重试前检查中断标志，用户中断不重试直接抛 InterruptedError；
+    - 每次重试重建 worker client，保证重试走全新连接。
+
+    Args:
+        agent: AIAgent 实例。
+        api_kwargs: 传给 responses.create 的参数（内部会转 input/tools）。
+        client: 可选外部 client（复用，不负责关闭）；缺省经
+            ``_make_worker_client`` 每次调用独立创建。
+        on_first_delta: 首个文本增量到达时回调一次（如停掉转圈动画）。
+        stale_timeout: 无响应判定超时（默认 agent._api_stale_timeout）。
     """
     if getattr(agent, "_interrupt_requested", False):
         raise InterruptedError("Agent interrupted before Codex stream")
@@ -234,78 +270,121 @@ def run_codex_stream(
     result: Dict[str, Any] = {"response": None, "error": None}
     client_holder = {"client": None}
     client_lock = threading.Lock()
+    # 断流续跑上限：transport 错误最多重试 1 次（对齐原版）
+    max_stream_retries = 1
 
     def _worker() -> None:
-        client = None
-        event_iter = None
-        try:
-            # ① 建 worker client（与 chat_completions 中断模式一致）
-            factory = getattr(agent, "_make_worker_client", None)
-            if factory is None:
-                from agent.chat_completion_helpers import _make_worker_client as _mwc
+        for attempt in range(max_stream_retries + 1):
+            worker_client = None
+            event_iter = None
+            try:
+                # ① 中断检查：每次尝试前确认（对齐原版 retry 前检查）
+                if getattr(agent, "_interrupt_requested", False):
+                    raise InterruptedError(
+                        "Agent interrupted before Codex stream retry"
+                    )
 
-                client = _mwc(agent)
-            else:
-                client = factory()
-            with client_lock:
-                client_holder["client"] = client
+                # ② 建 worker client（与 chat_completions 中断模式一致）。
+                #    外部传入的 client 直接复用；否则每次尝试独立创建——
+                #    断流重试时保证走全新连接。
+                if client is not None:
+                    worker_client = client
+                else:
+                    factory = getattr(agent, "_make_worker_client", None)
+                    if factory is None:
+                        from agent.chat_completion_helpers import (
+                            _make_worker_client as _mwc,
+                        )
 
-            # ② 参数转换：chat messages/tools → Responses input/tools
-            from agent.responses_adapter import (
-                _chat_messages_to_responses_input,
-                _normalize_codex_response,
-                _responses_tools,
-            )
+                        worker_client = _mwc(agent)
+                    else:
+                        worker_client = factory()
+                with client_lock:
+                    client_holder["client"] = worker_client
 
-            r_kwargs = dict(api_kwargs)
-            r_kwargs["input"] = _chat_messages_to_responses_input(
-                api_kwargs.get("messages")
-            )
-            r_kwargs["tools"] = _responses_tools(api_kwargs.get("tools"))
-            r_kwargs.pop("messages", None)
-            r_kwargs["stream"] = True
+                # ③ 参数转换：chat messages/tools → Responses input/tools
+                from agent.responses_adapter import (
+                    _chat_messages_to_responses_input,
+                    _normalize_codex_response,
+                    _responses_tools,
+                )
 
-            # ③ 打开事件流并消费聚合
-            event_iter = client.responses.create(**r_kwargs)
+                r_kwargs = dict(api_kwargs)
+                r_kwargs["input"] = _chat_messages_to_responses_input(
+                    api_kwargs.get("messages")
+                )
+                r_kwargs["tools"] = _responses_tools(api_kwargs.get("tools"))
+                r_kwargs.pop("messages", None)
+                r_kwargs["stream"] = True
 
-            from agent.chat_completion_helpers import _fire_stream_delta
+                # ④ 打开事件流：连接建立阶段的 transport 错误可重试
+                try:
+                    event_iter = worker_client.responses.create(**r_kwargs)
+                except _transport_error_types() as exc:
+                    if attempt < max_stream_retries:
+                        logger.debug(
+                            "Codex Responses stream connect failed "
+                            "(attempt %s/%s); retrying. error=%s",
+                            attempt + 1, max_stream_retries + 1, exc,
+                        )
+                        continue
+                    raise
 
-            final = _consume_codex_event_stream(
-                event_iter,
-                model=api_kwargs.get("model", ""),
-                on_text_delta=lambda t: _fire_stream_delta(agent, t),
-                on_first_delta=on_first_delta,
-                interrupt_check=lambda: bool(
-                    getattr(agent, "_interrupt_requested", False)
-                ),
-            )
+                # ⑤ 消费事件流：中途断流的 transport 错误可重试
+                from agent.chat_completion_helpers import _fire_stream_delta
 
-            # ④ 归一化成 chat 兼容对象
-            assistant_message, finish_reason = _normalize_codex_response(final)
-            result["response"] = SimpleNamespace(
-                id=final.id,
-                model=final.model,
-                choices=[SimpleNamespace(
-                    message=assistant_message,
-                    finish_reason=finish_reason,
-                )],
-                usage=_map_usage(final.usage),
-            )
-        except Exception as exc:
-            result["error"] = exc
-        finally:
-            if event_iter is not None:
-                close = getattr(event_iter, "close", None)
-                if callable(close):
+                try:
+                    final = _consume_codex_event_stream(
+                        event_iter,
+                        model=api_kwargs.get("model", ""),
+                        on_text_delta=lambda t: _fire_stream_delta(agent, t),
+                        on_first_delta=on_first_delta,
+                        interrupt_check=lambda: bool(
+                            getattr(agent, "_interrupt_requested", False)
+                        ),
+                    )
+                except _transport_error_types() as exc:
+                    if attempt < max_stream_retries:
+                        logger.debug(
+                            "Codex Responses stream transport failed mid-iteration "
+                            "(attempt %s/%s); retrying. error=%s",
+                            attempt + 1, max_stream_retries + 1, exc,
+                        )
+                        continue
+                    raise
+
+                # ⑥ 归一化成 chat 兼容对象
+                assistant_message, finish_reason = _normalize_codex_response(final)
+                result["response"] = SimpleNamespace(
+                    id=final.id,
+                    model=final.model,
+                    choices=[SimpleNamespace(
+                        message=assistant_message,
+                        finish_reason=finish_reason,
+                    )],
+                    usage=_map_usage(final.usage),
+                )
+                return
+            except Exception as exc:
+                # 中断 / 重试耗尽 / 其他错误：交主线程统一抛（中断由
+                # 主线程轮询先行检测，这里兜底记录）。
+                result["error"] = exc
+                return
+            finally:
+                if event_iter is not None:
+                    close = getattr(event_iter, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                # 自建 worker client 收尾也 close（幂等：中断路径已 close 过）；
+                # 外部传入的 client 由调用方负责生命周期。
+                if worker_client is not None and client is None:
                     try:
-                        close()
+                        worker_client.close()
                     except Exception:
                         pass
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    pass
 
     thread = threading.Thread(target=_worker, daemon=True, name="codex-stream-worker")
     thread.start()
@@ -332,3 +411,17 @@ def run_codex_stream(
     if result["error"] is not None:
         raise result["error"]
     return result["response"]
+
+
+def run_codex_create_stream_fallback(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+) -> Any:
+    """向后兼容别名（对应原版 codex_runtime.run_codex_create_stream_fallback）。
+
+    历史上是 SDK 高层 ``responses.stream(...)`` 形状漂移时的回退路径；主路径
+    ``run_codex_stream`` 现在已覆盖断流重试，因此这里直接转发。保留公开符号
+    供 run_agent.py 转发器与外部调用方引用。
+    """
+    return run_codex_stream(agent, api_kwargs, client=client)

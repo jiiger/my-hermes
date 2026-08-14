@@ -140,6 +140,43 @@ _RATE_LIMIT_BACKOFF_CAP_S = 14400
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 60
 
 
+def _resolve_fallback_api_mode(
+    agent,
+    fb_provider: str,
+    fb_model: str,
+    fb_base_url: str,
+) -> str:
+    """按回退条目推导 api_mode（对应原版 chat_completion_helpers.py:2064 精简版）。
+
+    my-hermes 只支持 chat_completions / codex_responses 两种协议，因此只保留
+    Responses 相关判定；anthropic/bedrock 分支已裁剪：
+    - openai-codex provider → codex_responses；
+    - Azure OpenAI → chat_completions（Azure 不支持 Responses API）；
+    - 直连 api.openai.com → codex_responses；
+    - 模型为 gpt-5.x（且 provider 非 nous/custom 例外）→ codex_responses；
+    - 其余 → chat_completions。
+
+    agent 方法用 getattr 防御：非 AIAgent 的假对象（测试）没有 URL 判定
+    方法时退化为纯 provider/model 判定。
+    """
+    fb_api_mode = "chat_completions"
+    if (fb_provider or "").strip().lower() == "openai-codex":
+        return "codex_responses"
+
+    _is_azure = getattr(agent, "_is_azure_openai_url", None)
+    if callable(_is_azure) and _is_azure(fb_base_url):
+        return "chat_completions"
+
+    _is_direct = getattr(agent, "_is_direct_openai_url", None)
+    if callable(_is_direct) and _is_direct(fb_base_url):
+        return "codex_responses"
+
+    _req_responses = getattr(agent, "_provider_model_requires_responses_api", None)
+    if callable(_req_responses) and _req_responses(fb_model, provider=fb_provider):
+        return "codex_responses"
+    return fb_api_mode
+
+
 def try_activate_fallback(
     agent, reason: "FailoverReason | None" = None
 ) -> bool:
@@ -216,6 +253,7 @@ def try_activate_fallback(
             "model": getattr(agent, "model", ""),
             "provider": getattr(agent, "provider", ""),
             "base_url": getattr(agent, "base_url", "") or "",
+            "api_mode": getattr(agent, "api_mode", "") or "chat_completions",
             "api_key": getattr(agent, "api_key", "") or "",
             "client_kwargs": dict(
                 getattr(agent, "_client_kwargs", None) or {}
@@ -245,6 +283,12 @@ def try_activate_fallback(
     agent.model = fb_model
     agent.provider = fb_provider
     agent.base_url = fb_base_url
+    # api_mode 随回退条目切换：主 provider 是 codex_responses 时回退到
+    # chat_completions 后端（如 deepseek），必须把协议一起切走，否则
+    # 会错误地请求 /v1/responses 端点（404）；反之亦然。
+    agent.api_mode = _resolve_fallback_api_mode(
+        agent, fb_provider, fb_model, fb_base_url
+    )
     agent.api_key = fb_api_key
     agent._client_kwargs = dict(fb_kwargs)
     agent.client = fb_client

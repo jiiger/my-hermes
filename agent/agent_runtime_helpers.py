@@ -100,6 +100,11 @@ def restore_primary_runtime(agent) -> bool:
         agent.model = rt["model"]
         agent.provider = rt["provider"]
         agent.base_url = rt["base_url"]
+        # 恢复主 provider 的 API 协议（快照由 try_activate_fallback 保存；
+        # 缺省兜底 chat_completions，兼容未含该字段的旧快照）
+        agent.api_mode = rt.get("api_mode") or getattr(
+            agent, "api_mode", "chat_completions"
+        )
         agent.api_key = rt["api_key"]
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent.client = create_openai_client(

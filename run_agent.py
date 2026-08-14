@@ -248,6 +248,69 @@ class AIAgent:
         kwargs.setdefault("flush", True)
         print(*args, **kwargs)
 
+    def _is_direct_openai_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets OpenAI's native API.
+
+        对应原版 run_agent.py:1336。直连 api.openai.com 时新模型默认走
+        Responses API（自动升级 api_mode 用）。
+        """
+        if base_url is not None:
+            hostname = base_url_hostname(base_url)
+        else:
+            hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
+                getattr(self, "_base_url_lower", "")
+            )
+        return hostname == "api.openai.com"
+
+    def _is_azure_openai_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets Azure OpenAI.
+
+        对应原版 run_agent.py:1346。Azure 的 OpenAI 兼容端点不支持
+        Responses API（gpt-5.x 也走 /chat/completions），自动升级时必须排除。
+        """
+        if base_url is not None:
+            url = str(base_url).lower()
+        else:
+            url = getattr(self, "_base_url_lower", "") or ""
+        return "openai.azure.com" in url
+
+    @staticmethod
+    def _model_requires_responses_api(model: str) -> bool:
+        """Return True for models that require the Responses API path.
+
+        对应原版 run_agent.py:1574。GPT-5.x 模型在 OpenAI/OpenRouter 的
+        /v1/chat/completions 上会被拒（unsupported_api_for_model），检测到
+        后自动把 api_mode 切到 codex_responses（与 provider 无关）。
+        """
+        m = (model or "").lower()
+        # 去掉 vendor 前缀（如 "openai/gpt-5.4" → "gpt-5.4"）
+        if "/" in m:
+            m = m.rsplit("/", 1)[-1]
+        return m.startswith("gpt-5")
+
+    @staticmethod
+    def _provider_model_requires_responses_api(
+        model: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> bool:
+        """Return True when this provider/model pair should use Responses API.
+
+        对应原版 run_agent.py:1589 精简版：保留 nous / custom 两个"明确走
+        chat_completions"的例外，其余按模型名判定（原版的 copilot 特化在
+        my-hermes 无对应支持，已裁剪）。
+        """
+        normalized_provider = (provider or "").strip().lower()
+        # Nous 用 OpenAI 兼容 chat completions 端点服务 gpt-5.x，
+        # 其 /v1/responses 返回 404，保持 chat_completions。
+        if normalized_provider == "nous":
+            return False
+        # 自定义端点保守处理：可能中转 gpt-5 但没有完整 Responses 语义，
+        # 不自动升级。
+        if normalized_provider == "custom":
+            return False
+        return AIAgent._model_requires_responses_api(model)
+
     def _needs_thinking_reasoning_pad(self) -> bool:
         """判断当前 provider 是否需要 reasoning_content 回填。
 
@@ -301,6 +364,30 @@ class AIAgent:
         return interruptible_streaming_api_call(
             self, api_kwargs, on_first_delta=on_first_delta, **kw
         )
+
+    def _run_codex_stream(
+        self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None
+    ) -> Any:
+        """Responses API 流式调用转发器（对应原版 run_agent.py:5363）。
+
+        Forwarder — see ``agent.codex_runtime.run_codex_stream``。
+        """
+        from agent.codex_runtime import run_codex_stream
+
+        return run_codex_stream(
+            self, api_kwargs, client=client, on_first_delta=on_first_delta
+        )
+
+    def _run_codex_create_stream_fallback(
+        self, api_kwargs: dict, client: Any = None
+    ) -> Any:
+        """Responses 断流回退转发器（对应原版 run_agent.py:5368）。
+
+        Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``。
+        """
+        from agent.codex_runtime import run_codex_create_stream_fallback
+
+        return run_codex_create_stream_fallback(self, api_kwargs, client)
 
     def _has_stream_consumers(self) -> bool:
         """是否有流式消费者（注册了 stream_delta_callback / _stream_callback）。

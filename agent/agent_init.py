@@ -160,7 +160,8 @@ def init_agent(
     )
 
     # ══════════════════════════════════════════════════════════════
-    # ③ api_mode 分类（原版 agent_init.py:633-670，多 provider 特化已裁剪）
+    # ③ api_mode 分类（原版 agent_init.py:633-670 精简版，多 provider 特化
+    #    只保留 Responses 相关：anthropic/bedrock 枚举保留但无对应 adapter）
     # ══════════════════════════════════════════════════════════════
     if api_mode in {
         "chat_completions",
@@ -170,8 +171,42 @@ def init_agent(
         "codex_app_server",
     }:
         agent.api_mode = api_mode
+    elif provider_name == "openai-codex":
+        # ChatGPT OAuth Codex 后端只支持 Responses API
+        agent.api_mode = "codex_responses"
+    elif provider_name in {"xai", "xai-oauth"}:
+        # xAI 用 Responses API（/v1/responses）
+        agent.api_mode = "codex_responses"
+    elif provider_name is None and (
+        (getattr(agent, "_base_url_hostname", "") or "") == "chatgpt.com"
+        and "/backend-api/codex" in (getattr(agent, "_base_url_lower", "") or "")
+    ):
+        # 未显式指定 provider + ChatGPT Codex 后端 URL → 自动识别
+        agent.api_mode = "codex_responses"
     else:
         agent.api_mode = "chat_completions"
+
+    # 自动升级（原版 agent_init.py:715-740 精简版）：api_mode 未显式指定
+    # 且落在 chat_completions 时，直连 OpenAI（api.openai.com）或模型为
+    # gpt-5.x（chat.completions 端点会拒发）→ 自动切到 codex_responses。
+    # Azure OpenAI 用 /chat/completions 服务 gpt-5.x、不支持 Responses，
+    # 必须排除；显式配置的 api_mode 一律尊重。
+    _is_azure = getattr(agent, "_is_azure_openai_url", None)
+    _is_direct = getattr(agent, "_is_direct_openai_url", None)
+    _req_responses = getattr(agent, "_provider_model_requires_responses_api", None)
+    if (
+        api_mode is None
+        and agent.api_mode == "chat_completions"
+        and not (callable(_is_azure) and _is_azure())
+        and (
+            (callable(_is_direct) and _is_direct())
+            or (
+                callable(_req_responses)
+                and _req_responses(agent.model, provider=agent.provider)
+            )
+        )
+    ):
+        agent.api_mode = "codex_responses"
 
     # ══════════════════════════════════════════════════════════════
     # ④ 回调（原版 agent_init.py:757-774；精简版只挂有签名对应的）
