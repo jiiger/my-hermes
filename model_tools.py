@@ -1,135 +1,143 @@
-"""工具装配 / 派发层（精简移植版）。
+"""工具装配 / 派发层（对齐原版 toolsets 语义的移植版）。
 
 对应原版 hermes-agent 的 model_tools.py（1569 行）。my-hermes 是 flat
-layout，顶层模块直接 import。精简版：
-- 用 _TOOL_MODULES 显式导入工具模块触发自注册
-  （替代原版 discover_builtin_tools 的 AST 扫描 + 磁盘缓存）；
-- 工具集过滤内联在 get_tool_definitions（选更简单的方案 a，
-  不建 toolsets.py；后续要加工具集只需扩展过滤逻辑）；
-- handle_function_call 查 registry 派发，未注册返回错误字符串（fail-open）；
-- build_tool_impls_map 生成 {工具名: handler} 映射，
-  喂给 my-hermes run_agent.AIAgent._tool_impls 供 _execute_tool_calls 使用。
+layout，顶层模块直接 import。本版按「方案 B」对齐原版：
+- 模块导入时即 discover_builtin_tools()（AST 扫描 + 磁盘缓存 + 自注册）；
+- get_tool_definitions 走原版 _compute_tool_definitions 语义：
+  enabled_toolsets 用 toolsets.resolve_toolset 收集 / disabled_toolsets
+  做严格减法 / 默认 get_all_toolsets 全收集（含 MCP 的 mcp-* toolset）；
+- quiet_mode 缓存（_tool_defs_cache + LRU），缓存键含 registry._generation
+  （MCP 注册/注销自动失效）；
+- 输出顺序为 registry.get_definitions 的字母序（对齐原版）。
+
+与原版裁剪：kanban/delegated/profile-scope 缓存键项、execute_code/discord
+动态 schema 重建、tool_search 装配（skip_tool_search_assembly 保留签名
+但忽略）、check_toolset_requirements/check_tool_availability（无消费方）。
 """
 
-import importlib
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from tools.registry import registry, tool_error
+from tools.registry import registry, tool_error, discover_builtin_tools
+from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# 工具模块清单：显式 import 触发模块级自注册。以后加工具只改这一个列表。
-# 顺序即 get_tool_definitions 的返回顺序（todo → file → terminal）。
-# ---------------------------------------------------------------------------
-_TOOL_MODULES = [
-    "tools.todo_tool",
-    "tools.file_tools",
-    "tools.terminal_tool",
-    "tools.memory_tool",
-    "tools.session_search_tool",
-    "tools.skills_tool",
-]
-
-# Phase 1 工具名的展示顺序（与 _TOOL_MODULES 一一对应）。
-# get_tool_definitions 按此顺序输出：即使其他代码提前单独导入某个工具
-# 模块（注册顺序被扰动），返回给 API 的工具列表顺序依然稳定。
-_TOOL_ORDER = [
-    "todo",
-    "read_file",
-    "write_file",
-    "patch",
-    "search_files",
-    "terminal",
-    "memory",
-    "session_search",
-    "skills_list",
-    "skill_view",
-    "skill_manage",
-]
-
-_tools_loaded = False
+# ── 模块导入时即发现内置工具（对齐原版 model_tools.py:214）──────────────
+# AST 扫描 tools/*.py 中顶层 registry.register(...) 的模块并 import 触发
+# 自注册；判定结果按 (mtime, size) 存磁盘缓存，热路径近零成本。
+discover_builtin_tools()
 
 
-def _ensure_tools_loaded() -> None:
-    """按 _TOOL_MODULES 导入工具模块（幂等）。
-
-    单个模块导入失败只告警不中断：其余工具仍可用。
-    """
-    global _tools_loaded
-    if _tools_loaded:
-        return
-    for mod_name in _TOOL_MODULES:
-        try:
-            importlib.import_module(mod_name)
-        except Exception as exc:
-            logger.warning("Could not import tool module %s: %s", mod_name, exc)
-    _tools_loaded = True
+# ── 兼容旧工具集名（原版 :254 精简：只保留 my-hermes 实际有工具的 legacy 名）
+_LEGACY_TOOLSET_MAP = {
+    "file_tools": ["read_file", "write_file", "patch", "search_files"],
+    "terminal_tools": ["terminal"],
+    "skills_tools": ["skills_list", "skill_view", "skill_manage"],
+}
 
 
-# ---------------------------------------------------------------------------
-# 工具集过滤：Phase 1 三个工具集 todo / file / terminal。
-# 与注册时 entry.toolset 字符串一致；"all"/"*" 表示全开。
-# ---------------------------------------------------------------------------
-
-
-def _toolset_enabled(
-    toolset: str,
-    enabled_toolsets: Optional[List[str]],
-    disabled_toolsets: Optional[List[str]],
-) -> bool:
-    """判断某个 toolset 是否应暴露（内联过滤，对应原版 toolsets.py 语义）。
-
-    enabled_toolsets 为 None = 不限制；否则只放行列表内的 toolset。
-    disabled_toolsets 为 None = 不排除；否则排除列表内的 toolset。
-    """
-    if enabled_toolsets is not None:
-        if "all" not in enabled_toolsets and toolset not in enabled_toolsets:
-            return False
-    if disabled_toolsets and toolset in disabled_toolsets:
-        return False
-    return True
+# ── get_tool_definitions 缓存（对齐原版 :247-297）───────────────────────
+# quiet_mode=True 时按缓存键记忆结果；LRU 淘汰防止长驻进程无限累积。
+_tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_TOOL_DEFS_CACHE_MAX = 8
 
 
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
+    skip_tool_search_assembly: bool = False,
 ) -> List[Dict[str, Any]]:
-    """返回 OpenAI 格式的工具 schema 列表（按注册顺序）。
+    """返回 OpenAI 格式的工具 schema 列表（原版 :305 签名 + 缓存语义）。
 
-    对应原版 model_tools.py:305 get_tool_definitions()；砍掉了
-    记忆化缓存、delegated-child / kanban 特判、平台工具集等逻辑。
-
-    Args:
-        enabled_toolsets: 只包含这些 toolset 的工具（None = 全开）。
-        disabled_toolsets: 排除这些 toolset 的工具（None = 不排除）。
-        quiet_mode: 静默模式（精简版仅影响 check_fn 失败时的日志级别）。
-
-    Returns:
-        [{"type": "function", "function": {name, description, parameters}}]
+    enabled_toolsets 为 None = 全开（静态 TOOLSETS + registry 派生工具集，
+    含 MCP 的 ``mcp-{server}``）；否则只包含指定工具集解析出的工具。
+    disabled_toolsets 最后做严格减法。quiet_mode=True 时结果被缓存，
+    缓存键含 registry._generation——MCP 工具注册/注销后自动失效。
     """
-    _ensure_tools_loaded()
-    order = {name: idx for idx, name in enumerate(_TOOL_ORDER)}
-    entries = [
-        entry
-        for entry in registry.iter_entries()
-        if _toolset_enabled(entry.toolset, enabled_toolsets, disabled_toolsets)
-    ]
-    # 稳定排序：_TOOL_ORDER 内的按声明顺序，其余（未来新增）排最后
-    entries.sort(key=lambda e: order.get(e.name, len(order)))
-    result = []
-    for entry in entries:
-        if entry.check_fn and not entry.check_fn():
-            if not quiet_mode:
-                logger.debug("Tool %s unavailable (check failed)", entry.name)
-            continue
-        # 确保 schema 始终有 "name" 字段
-        schema_with_name = {**entry.schema, "name": entry.name}
-        result.append({"type": "function", "function": schema_with_name})
+    # 快速路径：quiet 调用无需 stdout 打印时用记忆化结果。
+    # 缓存键捕获入参 + registry 代次（MCP 刷新/插件加载）+ config mtime
+    # （动态 schema 依赖 config 的场景）。
+    cache_key = None
+    if quiet_mode:
+        try:
+            from hermes_cli.config import get_config_path
+
+            cfg_stat = get_config_path().stat()
+            cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
+        except (FileNotFoundError, OSError, ImportError):
+            cfg_fp = None
+        cache_key = (
+            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+            frozenset(disabled_toolsets) if disabled_toolsets else None,
+            registry._generation,
+            cfg_fp,
+        )
+        cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
+        if cached is not None:
+            # 浅拷贝：下游（run_agent 追加工具 schema）不会污染缓存。
+            return list(cached)
+
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+    )
+    if quiet_mode and cache_key is not None:
+        # LRU 淘汰最旧条目，防长驻进程无限累积。
+        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
+        _tool_defs_cache[cache_key] = result
+        return list(result)
     return result
+
+
+def _compute_tool_definitions(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+    quiet_mode: bool = False,
+    skip_tool_search_assembly: bool = False,
+) -> List[Dict[str, Any]]:
+    """get_tool_definitions 的无缓存实现（对齐原版 :399 结构）。
+
+    流程：enabled/默认收集 → disabled 减法 → registry.get_definitions
+    取 schema（只返回 check_fn 通过且已注册的工具；TOOLSETS 里声明的
+    未移植工具名自动被忽略）。
+    """
+    del skip_tool_search_assembly  # my-hermes 无 tool_search，保留签名忽略
+
+    tools_to_include: set = set()
+
+    if enabled_toolsets is not None:
+        for ts_name in enabled_toolsets:
+            if validate_toolset(ts_name):
+                tools_to_include.update(resolve_toolset(ts_name))
+            elif ts_name in _LEGACY_TOOLSET_MAP:
+                tools_to_include.update(_LEGACY_TOOLSET_MAP[ts_name])
+            elif not quiet_mode:
+                logger.warning("Unknown toolset: %s", ts_name)
+    else:
+        # 默认全开：静态 TOOLSETS + registry 派生工具集（含 MCP mcp-*）。
+        from toolsets import get_all_toolsets
+
+        for ts_name in get_all_toolsets():
+            tools_to_include.update(resolve_toolset(ts_name))
+
+    # disabled 最后做严格减法：即使复合集启用，禁用集的工具也被剥除。
+    if disabled_toolsets:
+        for ts_name in disabled_toolsets:
+            if validate_toolset(ts_name):
+                tools_to_include.difference_update(resolve_toolset(ts_name))
+            elif ts_name in _LEGACY_TOOLSET_MAP:
+                tools_to_include.difference_update(_LEGACY_TOOLSET_MAP[ts_name])
+            elif not quiet_mode:
+                logger.warning("Unknown toolset: %s", ts_name)
+
+    # registry.get_definitions 按名字母序返回（对齐原版）。
+    return registry.get_definitions(tools_to_include, quiet=quiet_mode)
 
 
 def handle_function_call(
@@ -143,14 +151,8 @@ def handle_function_call(
     对应原版 model_tools.py:1123 handle_function_call()；精简版砍掉了
     middleware / hooks / 类型强转 / tool_search 桥接，只做注册表派发。
     未注册的工具返回错误字符串（fail-open，对话循环可继续）。
-
-    Args:
-        function_name: 工具名。
-        function_args: 参数字典（handler 以 **args 调用）。
-        task_id / user_task: 原版签名保留参数，精简版未使用。
     """
     del task_id, user_task
-    _ensure_tools_loaded()
     entry = registry.get_entry(function_name)
     if not entry:
         return tool_error(f"Unknown tool: {function_name}")
@@ -164,7 +166,6 @@ def handle_function_call(
 
 def get_all_tool_names() -> List[str]:
     """返回全部已注册工具名（对应原版 model_tools.py:1547）。"""
-    _ensure_tools_loaded()
     return registry.get_all_tool_names()
 
 
@@ -174,19 +175,21 @@ def build_tool_impls_map() -> Dict[str, Callable]:
     run_agent._execute_tool_calls 按此契约调用 impl(**args)；
     handler 的签名参数名与 schema properties 一致。
     """
-    _ensure_tools_loaded()
     return {entry.name: entry.handler for entry in registry.iter_entries()}
 
 
 def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     """返回工具所属 toolset（对应原版 model_tools.py:1552）。"""
-    _ensure_tools_loaded()
     return registry.get_toolset_for_tool(tool_name)
 
 
 def get_available_toolsets() -> Dict[str, dict]:
-    """返回 toolset 可用性信息（对应原版 model_tools.py:1556 的简化）。"""
-    _ensure_tools_loaded()
+    """返回 toolset 可用性信息（UI 显示用；保持 my-hermes 既有实现）。
+
+    遍历 registry 返回 {toolset: {available, tools}}（叶子 + mcp-*）。
+    原版 registry.get_available_toolsets 依赖 _snapshot_state 等较重内部
+    结构，my-hermes 精简版未移植——功能等价，仅缺 description/requirements。
+    """
     toolsets: Dict[str, dict] = {}
     for entry in registry.iter_entries():
         ts = entry.toolset
