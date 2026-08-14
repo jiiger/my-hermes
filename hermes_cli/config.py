@@ -184,3 +184,32 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
             return default
         node = node[key]
     return node
+
+
+def _parse_env_value(raw_value: str) -> str:
+    """解析 Hermes 自己写出的那一小撮 .env 值子集（原版 hermes_cli/config.py:3747 移植）。
+
+    仅处理最简单的情形：
+    - 双引号包裹：反转 ``\\"`` / ``\\\\`` 转义（与 save_env_value 写入端对称）；
+    - 单引号包裹：直接去掉外层引号；
+    - 其余原样返回（不做任何解析）。
+    """
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        quoted = value[1:-1]
+        parsed: list[str] = []
+        i = 0
+        while i < len(quoted):
+            ch = quoted[i]
+            if ch == "\\" and i + 1 < len(quoted):
+                next_ch = quoted[i + 1]
+                if next_ch in {'"', "\\"}:
+                    parsed.append(next_ch)
+                    i += 2
+                    continue
+            parsed.append(ch)
+            i += 1
+        return "".join(parsed)
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1]
+    return value
