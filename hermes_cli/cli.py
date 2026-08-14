@@ -509,6 +509,177 @@ def _resolve_runtime() -> tuple[str, str, str, str]:
     return api_key, base_url, model, provider
 
 
+_HELP_TEXT = """可用命令：
+  /help               显示本帮助
+  /new                开启新会话（清空上下文）
+  /quit               退出（或 Ctrl+C / Ctrl+D）
+  /sessions           列出历史会话
+  /resume <id|标题>   恢复指定会话
+  /tools              查看已注册工具
+  /skills             查看 skills 工具
+  /memory             查看记忆工具
+  /mcp                查看 MCP server 连接状态
+"""
+
+
+def _dispatch_slash_command(
+    agent: AIAgent, raw: str, history
+) -> tuple[Optional[str], object]:
+    """处理斜杠命令（对齐原版 cli_commands_mixin 的命令分发思路）。
+
+    Returns:
+        (status, history)：status 为 "quit"（退出）/ "handled"（已处理，
+        继续下一轮）/ None（非命令，走对话）；history 为可能被命令更新
+        的会话历史（/new 清空、/resume 恢复）。
+    """
+    cmd = raw.strip().lower()
+
+    if cmd in ("/quit", "/exit", "q", "quit", "exit"):
+        return "quit", history
+
+    if cmd == "/new":
+        # 新会话：轮换 session_id 并通知外部记忆 provider
+        # （对齐原版 /new 语义：commit_session_boundary_async 保证
+        # on_session_end 先于 on_session_switch，串行执行）。
+        _mm = getattr(agent, "_memory_manager", None)
+        if _mm is not None:
+            from datetime import datetime
+            import uuid as _uuid
+
+            _old_sid = agent.session_id
+            agent.session_id = (
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+            )
+            try:
+                _mm.commit_session_boundary_async(
+                    history or [],
+                    new_session_id=agent.session_id,
+                    parent_session_id=_old_sid or "",
+                    reason="new_session",
+                )
+            except Exception:
+                pass
+        print("（已开启新会话）\n")
+        return "handled", None
+
+    if cmd in ("/help", "help"):
+        print(_HELP_TEXT)
+        return "handled", history
+
+    if cmd == "/tools":
+        try:
+            import model_tools
+
+            toolsets = model_tools.get_available_toolsets()
+            for ts in sorted(toolsets):
+                tools = ", ".join(sorted(toolsets[ts]["tools"])) or "(空)"
+                print(f"  [{ts}] {tools}")
+        except Exception as exc:
+            print(f"⚠ 工具查询失败: {exc}")
+        return "handled", history
+
+    if cmd == "/sessions":
+        _db = getattr(agent, "_session_db", None)
+        if _db is None:
+            print("⚠ 会话存储不可用（本次对话未落库）")
+            return "handled", history
+        try:
+            sessions = _db.list_sessions(limit=20) or []
+            if not sessions:
+                print("（暂无历史会话）")
+            for s in sessions:
+                # list_sessions 无 title 字段；显示最后活动时间（可读格式）
+                # + 消息数，比原始 epoch 直观。
+                _ts_raw = s.get("last_activity_at") or s.get("started_at")
+                try:
+                    _ts = time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(float(_ts_raw))
+                    )
+                except (TypeError, ValueError):
+                    _ts = str(_ts_raw) if _ts_raw else "?"
+                _count = s.get("message_count")
+                _suffix = f"  {_count}条" if _count is not None else ""
+                print(f"  {s['id']}  {_ts}{_suffix}")
+        except Exception as exc:
+            print(f"⚠ 会话列表失败: {exc}")
+        return "handled", history
+
+    if cmd.startswith("/resume"):
+        rest = raw[len("/resume"):].strip()
+        if not rest:
+            print("用法：/resume <会话 ID 或标题>（/sessions 查看列表）")
+            return "handled", history
+        _db = getattr(agent, "_session_db", None)
+        if _db is None:
+            print("⚠ 会话存储不可用，无法恢复")
+            return "handled", history
+        try:
+            sessions = _db.list_sessions(limit=200) or []
+            target = None
+            for s in sessions:
+                if s["id"] == rest or (s.get("title") and rest in s["title"]):
+                    target = s
+                    break
+            if target is None:
+                print(f"未找到会话：{rest}")
+                return "handled", history
+            restored = _db.get_messages_as_conversation(target["id"])
+            agent.session_id = target["id"]
+            print(
+                f"（已恢复会话 {target['id']}，{len(restored)} 条消息）\n"
+            )
+            return "handled", restored
+        except Exception as exc:
+            print(f"⚠ 会话恢复失败: {exc}")
+            return "handled", history
+
+    if cmd == "/skills":
+        try:
+            import model_tools
+
+            toolsets = model_tools.get_available_toolsets()
+            skills = toolsets.get("skills", {}).get("tools", [])
+            print(f"  skills 工具：{', '.join(sorted(skills)) or '(空)'}")
+        except Exception as exc:
+            print(f"⚠ skills 查询失败: {exc}")
+        return "handled", history
+
+    if cmd == "/memory":
+        try:
+            import model_tools
+
+            toolsets = model_tools.get_available_toolsets()
+            memory = toolsets.get("memory", {}).get("tools", [])
+            print(f"  memory 工具：{', '.join(sorted(memory)) or '(空)'}")
+        except Exception as exc:
+            print(f"⚠ memory 查询失败: {exc}")
+        return "handled", history
+
+    if cmd == "/mcp":
+        try:
+            from tools.mcp_tool import get_mcp_status
+
+            status = get_mcp_status() or []
+            if not status:
+                print("（MCP 未连接——启动时后台发现，运行一次对话后再查）")
+            for s in status:
+                _mark = "✓" if s.get("connected") else "✗"
+                print(
+                    f"  {_mark} {s['name']}  "
+                    f"tools={s['tools']}  "
+                    f"{s.get('connect_error') or s.get('error') or ''}"
+                )
+        except Exception as exc:
+            print(f"⚠ MCP 状态查询失败: {exc}")
+        return "handled", history
+
+    if raw.startswith("/"):
+        print(f"未知命令：{raw.split()[0]}（/help 查看可用命令）")
+        return "handled", history
+
+    return None, history
+
+
 def interactive(agent: AIAgent) -> None:
     """交互模式：多轮对话，自动把上一轮 messages 传给下一轮。
 
@@ -556,32 +727,11 @@ def interactive(agent: AIAgent) -> None:
 
         if not user_input:
             continue
-        if user_input.lower() in ("/quit", "/exit", "q", "quit", "exit"):
+        # 斜杠命令分发（/quit /new /help /sessions /resume /tools ...）
+        status, history = _dispatch_slash_command(agent, user_input, history)
+        if status == "quit":
             break
-        if user_input.lower() == "/new":
-            # 新会话：轮换 session_id 并通知外部记忆 provider
-            # （对齐原版 /new 语义：commit_session_boundary_async 保证
-            # on_session_end 先于 on_session_switch，串行执行）。
-            _mm = getattr(agent, "_memory_manager", None)
-            if _mm is not None:
-                from datetime import datetime
-                import uuid as _uuid
-
-                _old_sid = agent.session_id
-                agent.session_id = (
-                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
-                )
-                try:
-                    _mm.commit_session_boundary_async(
-                        history or [],
-                        new_session_id=agent.session_id,
-                        parent_session_id=_old_sid or "",
-                        reason="new_session",
-                    )
-                except Exception:
-                    pass
-            history = None
-            print("（已开启新会话）\n")
+        if status == "handled":
             continue
 
         # 对话：把上一轮的 messages 作为 conversation_history 传入；
@@ -683,6 +833,50 @@ def once(agent: AIAgent, query: str) -> None:
         sys.exit(1)
 
 
+def create_agent_from_env() -> AIAgent:
+    """从环境/.env/config.yaml 解析凭据并构造 agent（入口层共用）。
+
+    对应原版 cli_agent_setup_mixin 的 agent 装配职责：凭据解析 →
+    SessionDB 注入 → AIAgent 构造。供 hermes_cli/main.py 的 chat 命令
+    与 cli.py 自身入口共用，避免两份装配逻辑漂移。
+
+    Raises:
+        RuntimeError: 凭据缺失（无 api_key 且无 base_url）或 agent 初始化失败。
+    """
+    api_key, base_url, model, provider = _resolve_runtime()
+
+    if not api_key and not base_url:
+        raise RuntimeError(
+            "未找到凭据。请先设置环境变量：\n"
+            "  export OPENAI_API_KEY=sk-xxx\n"
+            "  export OPENAI_BASE_URL=https://api.deepseek.com/v1   # 以 DeepSeek 为例\n"
+            "  export OPENAI_MODEL=deepseek-chat\n"
+            "或在 ~/.hermes/config.yaml 配置 model 段与 providers.<name> 段\n"
+        )
+
+    # 情节记忆：创建 SQLite 会话存储并注入 agent（对应原版 cli.py 的
+    # _session_db 初始化 + cli_agent_setup_mixin.py 的注入）。失败不阻断
+    # 启动，但明确告知持久化/恢复/搜索不可用。
+    session_db = None
+    try:
+        from hermes_state import SessionDB
+
+        session_db = SessionDB()
+    except Exception as _db_exc:
+        print(
+            f"⚠ Session store 不可用：本次对话不会落库、无法恢复、搜索禁用（{_db_exc}）"
+        )
+
+    agent = AIAgent(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        provider=provider,
+        session_db=session_db,
+    )
+    return agent
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     # argparse 解析（对应原版 hermes_cli/main.py 的 argparse 体系）：
     # --help 在任何凭据检查之前由 argparse 处理并 SystemExit(0)，
@@ -698,42 +892,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
-    # 参数解析：环境变量/.env > config.yaml（_resolve_runtime 内部实现）
-    api_key, base_url, model, provider = _resolve_runtime()
-
-    if not api_key and not base_url:
-        print(
-            "未找到凭据。请先设置环境变量：\n"
-            "  export OPENAI_API_KEY=sk-xxx\n"
-            "  export OPENAI_BASE_URL=https://api.deepseek.com/v1   # 以 DeepSeek 为例\n"
-            "  export OPENAI_MODEL=deepseek-chat\n"
-            "或在 ~/.hermes/config.yaml 配置 model 段与 providers.<name> 段\n"
-        )
-        sys.exit(1)
-
-    # 情节记忆：创建 SQLite 会话存储并注入 agent（对应原版 cli.py 的
-    # _session_db 初始化 + cli_agent_setup_mixin.py 的注入）。失败不阻断
-    # 启动，但明确告知持久化/恢复/搜索不可用。
-    session_db = None
+    # 装配 agent（凭据解析 + SessionDB + AIAgent 构造）
     try:
-        from hermes_state import SessionDB
-
-        session_db = SessionDB()
-    except Exception as _db_exc:
-        print(
-            f"⚠ Session store 不可用：本次对话不会落库、无法恢复、搜索禁用（{_db_exc}）"
-        )
-
-    try:
-        agent = AIAgent(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            provider=provider,
-            session_db=session_db,
-        )
+        agent = create_agent_from_env()
     except RuntimeError as exc:
-        print(f"❌ Agent 初始化失败: {exc}")
+        print(f"❌ {exc}")
         sys.exit(1)
 
     _print_banner(agent)

@@ -380,8 +380,9 @@ all = [
 
 
 [project.scripts]
-#hermes = "hermes_cli.main:main"
-hermes-agent = "run_agent:main"
+# CLI 层入口（对齐原版 hermes_cli.main:main）：子命令 chat/version/doctor。
+# run_agent:main 保留为库级极简入口（AIAgent 直接驱动，不经过 CLI 层）。
+hermes-agent = "hermes_cli.main:main"
 #hermes-acp = "acp_adapter.entry:main"
 
 [build-system]
