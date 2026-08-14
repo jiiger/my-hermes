@@ -579,17 +579,29 @@ def init_agent(
                     )
                     # provider 工具合并进工具面：schema 进 agent.tools、
                     # 工具名进 valid_tool_names、handler 转发到 manager
-                    for _schema in agent._memory_manager.get_all_tool_schemas():
-                        _tname = _schema.get("name")
-                        if not _tname or _tname in agent.valid_tool_names:
-                            continue
-                        agent.tools.append({"type": "function", "function": _schema})
-                        agent.valid_tool_names.add(_tname)
-                        agent._tool_impls[_tname] = (
-                            lambda *a, _n=_tname, **kw: agent._memory_manager.handle_tool_call(
-                                _n, dict(kw)
+                    # 门控对齐原版 inject_memory_provider_tools：
+                    # disabled memory / 显式 toolsets 不含 memory 时不暴露
+                    # provider 工具（记忆引擎仍工作，只是模型无工具）。
+                    from agent.memory_manager import memory_provider_tools_enabled
+
+                    if memory_provider_tools_enabled(
+                        enabled_toolsets,
+                        disabled_toolsets,
+                        memory_tool_present="memory" in agent.valid_tool_names,
+                    ):
+                        for _schema in agent._memory_manager.get_all_tool_schemas():
+                            _tname = _schema.get("name")
+                            if not _tname or _tname in agent.valid_tool_names:
+                                continue
+                            agent.tools.append(
+                                {"type": "function", "function": _schema}
                             )
-                        )
+                            agent.valid_tool_names.add(_tname)
+                            agent._tool_impls[_tname] = (
+                                lambda *a, _n=_tname, **kw: agent._memory_manager.handle_tool_call(
+                                    _n, dict(kw)
+                                )
+                            )
                 else:
                     agent._memory_manager = None
         except Exception as _mpe:

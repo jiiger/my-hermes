@@ -139,6 +139,45 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     return schema
 
 
+def memory_provider_tools_enabled(
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]] = None,
+    *,
+    memory_tool_present: bool = False,
+) -> bool:
+    """外部 memory-provider 工具是否应暴露（对应原版 memory_manager.py:83）。
+
+    规则（对齐原版）：
+    - disabled 显式含 "memory" → 不暴露；
+    - registry 里已有 memory 工具（memory_tool_present）→ 暴露；
+    - enabled 未限制（None）→ 暴露；
+    - enabled 为空列表 → 不暴露；
+    - enabled 含 "memory" → 暴露；
+    - 否则看 enabled 各工具集解析结果里是否含 memory 工具。
+    """
+    if disabled_toolsets and "memory" in disabled_toolsets:
+        return False
+    if memory_tool_present:
+        return True
+    if enabled_toolsets is None:
+        return True
+    if not enabled_toolsets:
+        return False
+    if "memory" in enabled_toolsets:
+        return True
+
+    try:
+        from toolsets import resolve_toolset
+
+        return any("memory" in resolve_toolset(name) for name in enabled_toolsets)
+    except Exception:
+        logger.debug(
+            "Failed to resolve enabled toolsets for memory-provider tools",
+            exc_info=True,
+        )
+        return False
+
+
 # ─── 上下文围栏辅助 ─────────────────────────────────────────────────────
 
 _FENCE_TAG_RE = re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE)

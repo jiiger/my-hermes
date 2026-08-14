@@ -1981,8 +1981,10 @@ def refresh_agent_mcp_tools(
     的刷新入口：每回合 between-turns 刷新（turn_context）都调它。
 
     my-hermes 精简点（对照原版）：
-    - 原版的 ``_reinject_post_build_tools``（memory-provider / context-engine
-      工具）未移植，无需重注入；
+    - 原版 ``_reinject_post_build_tools`` 的 memory-provider 部分已移植
+      （``_reinject_memory_provider_tools``，保证外部记忆 provider 工具如
+      holographic fact_store 不被重建快照冲掉）；context-engine 部分未
+      移植（my-hermes 的 compressor 无 get_tool_schemas / lcm_* 工具）；
     - 无 ``_agent_tools_lock`` / ``_tool_snapshot_generation``（原版防两个
       并发刷新互相覆盖）；my-hermes 刷新只发生在对话循环线程，后台线程
       只写 registry（registry 自带锁），不存在并发发布竞争。
@@ -2020,6 +2022,10 @@ def refresh_agent_mcp_tools(
         or []
     )
     new_names = {t["function"]["name"] for t in new_defs}
+    # 重注入 memory-provider 工具（agent_init 追加进 agent.tools 的
+    # fact_store 等不在 registry 里，重建快照必须补回；返回 handler 供
+    # 发布 _tool_impls，对齐 agent_init 的 lambda 转发）。
+    provider_handlers = _reinject_memory_provider_tools(agent, new_defs, new_names)
 
     current = {
         t["function"]["name"]
@@ -2036,7 +2042,71 @@ def refresh_agent_mcp_tools(
     agent._tool_impls = {
         entry.name: entry.handler for entry in registry.iter_entries()
     }
+    for _tname, _thandler in provider_handlers:
+        agent._tool_impls[_tname] = _thandler
     return new_names - current
+
+
+def _reinject_memory_provider_tools(
+    agent, tools_list: list, name_set: set
+) -> list:
+    """把外部 memory-provider 工具追加回快照（对应原版
+    ``_reinject_post_build_tools`` 的 memory-provider 部分）。
+
+    agent_init 构建时会把已激活 provider（如 holographic）的工具
+    （fact_store / fact_feedback）追加进 agent.tools；但本函数重建快照
+    用的是 registry 派生集合，这些工具不在 registry 里会被冲掉。这里
+    按原版纪律重新追加：遵守 ``memory_provider_tools_enabled`` 门控、
+    按名去重、fail-soft。
+
+    Returns:
+        [(name, handler), ...]：本次实际追加的工具及其 handler 转发器，
+        调用方在发布 ``_tool_impls`` 时补回（my-hermes 派发走
+        ``_tool_impls``，原版走 registry 路由）。
+    """
+    added: list = []
+
+    def _add(schema: dict) -> bool:
+        name = schema.get("name", "")
+        if not name or name in name_set:
+            return False
+        tools_list.append({"type": "function", "function": schema})
+        name_set.add(name)
+        return True
+
+    try:
+        memory_manager = getattr(agent, "_memory_manager", None)
+        get_mem_schemas = (
+            getattr(memory_manager, "get_all_tool_schemas", None)
+            if memory_manager
+            else None
+        )
+        if callable(get_mem_schemas):
+            from agent.memory_manager import memory_provider_tools_enabled
+
+            if memory_provider_tools_enabled(
+                getattr(agent, "enabled_toolsets", None),
+                getattr(agent, "disabled_toolsets", None),
+                memory_tool_present="memory" in name_set,
+            ):
+                for schema in get_mem_schemas():
+                    if not isinstance(schema, dict):
+                        continue
+                    if _add(schema):
+                        _tname = schema.get("name", "")
+                        added.append((_tname, _provider_handler(agent, _tname)))
+    except Exception:
+        logger.debug("Memory-provider tool re-injection skipped", exc_info=True)
+    return added
+
+
+def _provider_handler(agent, tool_name: str) -> Callable:
+    """构造转发到 memory_manager.handle_tool_call 的 handler（对齐 agent_init）。"""
+
+    def _handler(*args, **kw):
+        return agent._memory_manager.handle_tool_call(tool_name, dict(kw))
+
+    return _handler
 
 
 def shutdown_mcp_servers() -> None:
@@ -2085,4 +2155,3 @@ __all__ = [
     "mcp_prefixed_tool_name",
     "sanitize_mcp_name_component",
 ]
-
