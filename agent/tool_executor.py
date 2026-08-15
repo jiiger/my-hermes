@@ -280,11 +280,13 @@ def execute_tool_calls_concurrent(
         })
 
         if not getattr(agent, "quiet_mode", True) and getattr(agent, "tool_progress_mode", "all") != "off":
+            _mark = "❌" if _is_error else "✅"
             if getattr(agent, "verbose_logging", False):
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
-            else:
                 preview = function_result[:200] if len(function_result) > 200 else function_result
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {preview}")
+                print(f"  {_mark} Tool {i+1} ({name}) completed in {tool_duration:.2f}s - {preview}")
+            else:
+                # 普通模式只报工具名与成败，不糊结果 JSON（用户 2026-08-15 要求）
+                print(f"  {_mark} Tool {i+1} ({name}) completed in {tool_duration:.2f}s")
 
     # ── 批末聚合预算 ──
     if finalize and num_tools > 0:
@@ -340,8 +342,10 @@ def execute_tool_calls_sequential(
         tool_start_time = time.time()
         tool_impls = getattr(agent, "_tool_impls", {})
         impl = tool_impls.get(function_name)
+        is_error = False
         if impl is None:
             function_result = f"错误: 未注册的工具 {function_name}"
+            is_error = True
         else:
             try:
                 function_result = impl(**function_args)
@@ -349,8 +353,10 @@ def execute_tool_calls_sequential(
                 # Ctrl+C 优雅中断（对齐原版 agent/tool_executor.py:2156）
                 agent.interrupt("keyboard interrupt")
                 function_result = "工具执行被用户中断 (keyboard interrupt)"
+                is_error = True
             except Exception as exc:
                 function_result = f"工具执行异常: {type(exc).__name__}: {exc}"
+                is_error = True
         tool_duration = time.time() - tool_start_time
 
         function_result = str(function_result)
@@ -375,11 +381,13 @@ def execute_tool_calls_sequential(
         })
 
         if not getattr(agent, "quiet_mode", True) and getattr(agent, "tool_progress_mode", "all") != "off":
+            _mark = "❌" if is_error else "✅"
             if getattr(agent, "verbose_logging", False):
-                print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
-            else:
                 preview = function_result[:200] if len(function_result) > 200 else function_result
-                print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {preview}")
+                print(f"  {_mark} Tool {i} ({function_name}) completed in {tool_duration:.2f}s - {preview}")
+            else:
+                # 普通模式只报工具名与成败，不糊结果 JSON（用户 2026-08-15 要求）
+                print(f"  {_mark} Tool {i} ({function_name}) completed in {tool_duration:.2f}s")
 
     # ── 批末聚合预算 ──
     num_tools_seq = len(tool_calls)

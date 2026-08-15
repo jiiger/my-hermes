@@ -634,8 +634,14 @@ def run_conversation(
             #     没有 → 模型给出了最终回答，收尾退出
             if assistant_message.tool_calls:
                 if not getattr(agent, "quiet_mode", False):
+                    _names = ", ".join(
+                        getattr(tc, "function", None).name
+                        if getattr(tc, "function", None)
+                        else "?"
+                        for tc in assistant_message.tool_calls
+                    )
                     agent._safe_print(
-                        f"🔧 Processing {len(assistant_message.tool_calls)} tool call(s)..."
+                        f"🔧 Processing {len(assistant_message.tool_calls)} tool call(s): {_names}"
                     )
     
                 # 把 assistant 消息（含 tool_calls）归档进 messages：
