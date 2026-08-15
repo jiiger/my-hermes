@@ -551,6 +551,18 @@ def init_agent(
     agent._session_messages = None
 
     # ══════════════════════════════════════════════════════════════
+    # ⑫¼ 插件系统懒发现：首次 invoke_hook 会自动触发，这里显式调用一次
+    # 让插件工具/中间件在 agent 启动时就绪（而非等第一轮钩子）。失败只记
+    # warning，绝不影响 agent 启动（对齐原版 agent_init 的容错姿态）。
+    # ══════════════════════════════════════════════════════════════
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        logger.warning("plugin discovery failed; continuing without plugins", exc_info=True)
+
+    # ══════════════════════════════════════════════════════════════
     # ⑫½ 外部记忆 provider（MemoryManager）——按原版 agent_init.py:1727-1790
     # 精简。读 config memory.provider → 插件加载器加载 → 注册进 MemoryManager
     # → initialize_all；provider 工具合并进 agent.tools / _tool_impls。

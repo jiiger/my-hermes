@@ -202,6 +202,30 @@ def build_system_prompt_parts(
         except Exception:
             pass
 
+    # 3¾ 插件系统提示词段：把已注册插件的提示词段渲染结果并入 volatile
+    #    （对齐原版 system_prompt.py 的插件段消费；render 首次调用触发插件
+    #    懒发现）。try/except 包住，失败不影响系统提示构建。
+    try:
+        from hermes_cli.plugins import (
+            format_system_prompt_sections,
+            render_system_prompt_sections,
+        )
+
+        _plugin_sections = render_system_prompt_sections(
+            {
+                "session_id": getattr(agent, "session_id", "") or "",
+                "model": getattr(agent, "model", "") or "",
+                "platform": getattr(agent, "platform", "") or "cli",
+                "provider": getattr(agent, "provider", "") or "",
+            }
+        )
+        if _plugin_sections:
+            _plugin_blocks = format_system_prompt_sections(_plugin_sections)
+            if _plugin_blocks:
+                volatile_parts.append(_plugin_blocks)
+    except Exception:
+        pass
+
     from hermes_time import now as _hermes_now
 
     now = _hermes_now()

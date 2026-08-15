@@ -7,6 +7,7 @@
   工具执行 / 拿到最终回答退出。
 """
 
+import logging
 import time
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +15,8 @@ from agent.error_classifier import classify_api_error
 from agent.process_bootstrap import _install_safe_stdio
 from agent.conversation_compression import conversation_history_after_compression
 from agent.turn_context import build_turn_context
+
+logger = logging.getLogger(__name__)
 
 
 def _restore_or_build_system_prompt(
@@ -170,6 +173,22 @@ def run_conversation(
     _turn_exit_reason = "completed"  # 轮次退出原因（中断/预算/API失败/正常完成）
     # TODO fallback：每轮开始恢复主 provider（原版 restore_primary_runtime，
     #     功能待实现——agent_init 已保留 _fallback_chain 等状态与 fallback_model 参数）
+
+    # ① 会话开始钩子：插件观察本轮会话启动（对应原版 conversation_loop.py:721
+    #    on_session_start 消费点）。has_hook 先判断（空表零开销），invoke_hook
+    #    首次调用自动触发插件懒发现；try/except 包住，失败绝不影响主流程。
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if has_hook("on_session_start"):
+            invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=getattr(agent, "model", "") or "",
+                platform=getattr(agent, "platform", "") or "cli",
+            )
+    except Exception:
+        logger.warning("on_session_start hook failed", exc_info=True)
 
     # ══════════════════════════════════════════════════════════════
     # 主循环：每轮 = "调 API → 有工具调用就执行工具继续下一轮，
@@ -354,6 +373,51 @@ def run_conversation(
             response = None
             api_request_id = f"{turn_id}:api:{api_call_count}"  # 每次调用一个请求ID
             agent._current_api_request_id = api_request_id
+
+            # ②½ API 请求前钩子：插件可观察/注入本轮请求（对应原版
+            #    conversation_loop.py:2675 pre_api_request 消费点）。若插件
+            #    返回 {"user_context": "..."}，把该文本合并进 API 的当前
+            #    user 消息（对齐原版 pre_llm_call "context 注入 user message"
+            #    语义，注入的是 user 消息而非系统提示，保住前缀缓存）。
+            try:
+                from hermes_cli.plugins import has_hook, invoke_hook
+
+                if has_hook("pre_api_request"):
+                    _hook_results = invoke_hook(
+                        "pre_api_request",
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id,
+                        messages=messages,
+                        model=getattr(agent, "model", "") or "",
+                        provider=getattr(agent, "provider", "") or "",
+                    )
+                    for _hr in _hook_results:
+                        if (
+                            isinstance(_hr, dict)
+                            and isinstance(_hr.get("user_context"), str)
+                            and _hr["user_context"].strip()
+                        ):
+                            _plugin_user_context = _hr["user_context"]
+                            break
+            except Exception:
+                logger.warning("pre_api_request hook failed", exc_info=True)
+
+            if _plugin_user_context:
+                _injected = str(_plugin_user_context).strip()
+                if _injected:
+                    # 合并到 API 的最后一条 user 消息（当前轮用户消息）。
+                    for _api_msg in reversed(api_messages):
+                        if (
+                            _api_msg.get("role") == "user"
+                            and isinstance(_api_msg.get("content"), str)
+                        ):
+                            _api_msg["content"] = (
+                                _injected + "\n\n" + _api_msg["content"]
+                            )
+                            break
+
             # 错误触发压缩的次数上限（对应原版 max_compression_attempts，缺省 3）
             # 与"压缩后回退外层循环重试"标志（对齐原版 _retry.restart_with_compressed_messages）
             _max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
@@ -397,6 +461,26 @@ def run_conversation(
                                 "total_tokens": getattr(_usage, "total_tokens", None),
                             }
                         _compressor.update_from_response(_usage)
+
+                    # ②¾ API 响应后钩子：插件观察本轮请求结果与用时（对应
+                    #    原版 conversation_loop.py:6262 post_api_request 消费点）。
+                    try:
+                        from hermes_cli.plugins import has_hook, invoke_hook
+
+                        if has_hook("post_api_request"):
+                            invoke_hook(
+                                "post_api_request",
+                                task_id=effective_task_id,
+                                turn_id=turn_id,
+                                api_request_id=api_request_id,
+                                session_id=agent.session_id,
+                                messages=messages,
+                                model=getattr(agent, "model", "") or "",
+                                provider=getattr(agent, "provider", "") or "",
+                                duration=time.time() - api_start_time,
+                            )
+                    except Exception:
+                        logger.warning("post_api_request hook failed", exc_info=True)
                     break  # 成功拿到响应，退出重试循环
                 except InterruptedError:
                     # 用户中断：不重试，整轮退出（与循环顶部的中断检查殊途同归）
@@ -580,6 +664,25 @@ def run_conversation(
     
                 # 顺序执行工具调用：结果以 role="tool" 消息追加进 messages
                 # （对应原版 6365 行）
+                # ②¼ 工具调用前钩子：逐个工具触发 pre_tool_call（对应原版
+                #    conversation_loop.py pre_tool_call 消费点；本版只在钩子
+                #    总线层留名，不做白名单指令）。
+                try:
+                    from hermes_cli.plugins import has_hook, invoke_hook
+
+                    if has_hook("pre_tool_call"):
+                        _tc_list = getattr(assistant_message, "tool_calls", None) or []
+                        for _tc in _tc_list:
+                            _fn = getattr(_tc, "function", None)
+                            invoke_hook(
+                                "pre_tool_call",
+                                tool_name=getattr(_fn, "name", "") or "",
+                                arguments=getattr(_fn, "arguments", "") or "",
+                                session_id=agent.session_id,
+                            )
+                except Exception:
+                    logger.warning("pre_tool_call hook failed", exc_info=True)
+
                 agent._execute_tool_calls(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
@@ -688,6 +791,25 @@ def run_conversation(
     # clear_interrupt()）。这样用户的一次中断只影响当前轮，不会
     # 污染下一轮对话。
     agent.clear_interrupt()
+
+    # ③ 会话结束钩子：插件观察本轮收尾（对应原版 turn_finalizer.py:775
+    #    on_session_end 消费点；my-hermes 无 turn_finalizer，挂在返回前）。
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if has_hook("on_session_end"):
+            invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                model=getattr(agent, "model", "") or "",
+                provider=getattr(agent, "provider", "") or "",
+                status="interrupted"
+                if interrupted
+                else ("failed" if failed else "completed"),
+                turn_exit_reason=_turn_exit_reason,
+            )
+    except Exception:
+        logger.warning("on_session_end hook failed", exc_info=True)
 
     return {
         "final_response": final_response,
