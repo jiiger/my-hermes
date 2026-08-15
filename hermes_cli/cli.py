@@ -519,6 +519,7 @@ _HELP_TEXT = """可用命令：
   /skills             查看 skills 工具
   /memory             查看记忆工具
   /mcp                查看 MCP server 连接状态
+  /plugin             查看已启用的插件
 """
 
 
@@ -671,6 +672,44 @@ def _dispatch_slash_command(
                 )
         except Exception as exc:
             print(f"⚠ MCP 状态查询失败: {exc}")
+        return "handled", history
+
+    if cmd == "/plugin":
+        # 查看已启用插件：触发一次懒发现，列出已加载插件的清单与注册面
+        # （hooks/tools/middleware 为该插件实际注册的项，非 manifest 声明）。
+        try:
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            discover_plugins()
+            plugins = get_plugin_manager()._plugins
+            if not plugins:
+                print("（未启用任何插件）")
+                return "handled", history
+            for _p in plugins.values():
+                _m = _p.manifest
+                _mark = "✓" if _p.enabled else ("✗" if _p.error else "·")
+                _line = f"  {_mark} {_m.name}"
+                if _m.version:
+                    _line += f"  v{_m.version}"
+                _line += f"  [{_m.kind}]"
+                if _m.source:
+                    _line += f"  ({_m.source})"
+                if _m.description:
+                    _line += f"  {_m.description}"
+                print(_line)
+                _regs = []
+                if _p.hooks_registered:
+                    _regs.append(f"hooks={', '.join(_p.hooks_registered)}")
+                if _p.tools_registered:
+                    _regs.append(f"tools={', '.join(_p.tools_registered)}")
+                if _p.middleware_registered:
+                    _regs.append(f"middleware={', '.join(_p.middleware_registered)}")
+                if _regs:
+                    print(f"      {'  '.join(_regs)}")
+                if _p.error:
+                    print(f"      ⚠ {_p.error}")
+        except Exception as exc:
+            print(f"⚠ 插件查询失败: {exc}")
         return "handled", history
 
     if raw.startswith("/"):
