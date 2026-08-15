@@ -351,9 +351,9 @@ registry.register(
     name="web_search",
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
-    handler=lambda args, **kw: web_search_tool(
-        args.get("query", ""),
-        limit=args.get("limit", 5),
+    handler=lambda **kw: web_search_tool(
+        kw.get("query", ""),
+        limit=kw.get("limit", 5),
     ),
     check_fn=None,  # 工具始终可见；调用时才懒发现插件并解析 provider
     emoji="🔍",
@@ -362,10 +362,10 @@ registry.register(
     name="web_extract",
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
-    handler=lambda args, **kw: web_extract_tool(
-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
+    handler=lambda **kw: asyncio.run(web_extract_tool(
+        kw.get("urls", [])[:5] if isinstance(kw.get("urls"), list) else [],
         "markdown",
-    ),
+    )),
     check_fn=None,
     is_async=True,
     emoji="📄",
