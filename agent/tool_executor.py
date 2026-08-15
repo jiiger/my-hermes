@@ -175,6 +175,40 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         })
 
 
+def _emit_post_tool_call_hook(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict,
+    result: Any,
+    task_id: str = "",
+    tool_call_id: str = "",
+    duration_ms: int = 0,
+) -> None:
+    """工具执行完成后触发 post_tool_call 观察钩子（2026-08 为 disk-cleanup 补回）。
+
+    无监听者时零开销（has_hook 门控，对应原版 model_tools.py:1116
+    _emit_post_tool_call_hook 的思路）；回调异常被隔离，绝不打断工具链路。
+    """
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if not has_hook("post_tool_call"):
+            return
+        invoke_hook(
+            "post_tool_call",
+            tool_name=function_name,
+            args=function_args,
+            result=result,
+            task_id=task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        pass
+
+
 def execute_tool_calls_concurrent(
     agent,
     assistant_message,
@@ -278,6 +312,18 @@ def execute_tool_calls_concurrent(
             "name": name,
             "content": function_result,
         })
+        # post_tool_call 观察钩子：工具执行完成后派发（供插件登记临时文件
+        # 等观察用途；has_hook 门控，无监听者零开销）。并发路径在收集循环
+        # 里按模型发出顺序触发，与消息追加顺序一致。
+        _emit_post_tool_call_hook(
+            agent,
+            function_name=name,
+            function_args=args,
+            result=function_result,
+            task_id=effective_task_id,
+            tool_call_id=tc.id,
+            duration_ms=int(tool_duration * 1000),
+        )
 
         if not getattr(agent, "quiet_mode", True) and getattr(agent, "tool_progress_mode", "all") != "off":
             _mark = "❌" if _is_error else "✅"
@@ -379,15 +425,17 @@ def execute_tool_calls_sequential(
             "name": function_name,
             "content": function_result,
         })
-
-        if not getattr(agent, "quiet_mode", True) and getattr(agent, "tool_progress_mode", "all") != "off":
-            _mark = "❌" if is_error else "✅"
-            if getattr(agent, "verbose_logging", False):
-                preview = function_result[:200] if len(function_result) > 200 else function_result
-                print(f"  {_mark} Tool {i} ({function_name}) completed in {tool_duration:.2f}s - {preview}")
-            else:
-                # 普通模式只报工具名与成败，不糊结果 JSON（用户 2026-08-15 要求）
-                print(f"  {_mark} Tool {i} ({function_name}) completed in {tool_duration:.2f}s")
+        # post_tool_call 观察钩子：工具执行完成后派发（供插件登记临时文件
+        # 等观察用途；has_hook 门控，无监听者零开销）。
+        _emit_post_tool_call_hook(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            result=function_result,
+            task_id=effective_task_id,
+            tool_call_id=tool_call.id,
+            duration_ms=int(tool_duration * 1000),
+        )
 
     # ── 批末聚合预算 ──
     num_tools_seq = len(tool_calls)

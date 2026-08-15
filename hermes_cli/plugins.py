@@ -10,7 +10,8 @@ PluginManager → 模块级入口``，形成"发现 → 加载 → 注册 → �
   slack/approval_transport）；
 - inject_message / platform_actions / 预工具调用指令（resolve_pre_tool_block 等）；
 - 插件错误分类 / 调试 handler（_install_plugin_debug_handler）/ 技能命名空间 /
-  便携 MCP 注册 / CLI 斜杠命令注册（register_command / register_cli_command）；
+  便携 MCP 注册 / CLI 斜杠命令注册（register_cli_command，register_command
+  已于 2026-08 补回精简版，见 PluginContext.register_command）；
 - on_session_finalize / on_session_reset 钩子。
 
 保留的内容：
@@ -18,8 +19,9 @@ PluginManager → 模块级入口``，形成"发现 → 加载 → 注册 → �
 - 系统提示词段渲染（render_system_prompt_sections + PluginSystemPromptSection
   + format_system_prompt_section / format_system_prompt_sections）；
 - 中间件接口（invoke_middleware / has_middleware / register_middleware）；
-- 钩子集（只保留 5 个）：on_session_start / pre_api_request / post_api_request /
-  pre_tool_call / on_session_end。
+- 钩子集（只保留 6 个）：on_session_start / pre_api_request / post_api_request /
+  pre_tool_call / post_tool_call / on_session_end。post_tool_call 是 2026-08
+  为 disk-cleanup 插件补回（工具执行完成后触发，供登记临时文件等观察用途）。
 """
 
 import copy
@@ -48,12 +50,15 @@ logger = logging.getLogger(__name__)
 # 常量
 # ══════════════════════════════════════════════════════════════════
 
-# 钩子集：只保留 5 个（原版 plugins.py:156 VALID_HOOKS 有数十个，其余不接）。
+# 钩子集：只保留 6 个（原版 plugins.py:156 VALID_HOOKS 有数十个，其余不接）。
+# post_tool_call 于 2026-08 补回：disk-cleanup 等观察型插件需要工具执行
+# 完成后的结果（pre_tool_call 只有参数、拿不到 result）。
 VALID_HOOKS: Set[str] = {
     "on_session_start",
     "pre_api_request",
     "post_api_request",
     "pre_tool_call",
+    "post_tool_call",
     "on_session_end",
 }
 
@@ -295,6 +300,7 @@ class LoadedPlugin:
     tools_registered: List[str] = field(default_factory=list)
     hooks_registered: List[str] = field(default_factory=list)
     middleware_registered: List[str] = field(default_factory=list)
+    commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
 
@@ -438,10 +444,11 @@ class PluginState:
 class PluginContext:
     """插件上下文门面（对应原版 plugins.py:1388 精简版）。
 
-    只保留 11 个注册/查询方法：
+    只保留 12 个注册/查询方法：
     get_config / set_config / state / on_unload / register_tool /
-    register_memory_provider / register_hook / register_system_prompt_section /
-    register_web_search_provider / emit / subscribe / register_middleware，
+    register_command / register_memory_provider / register_hook /
+    register_system_prompt_section / register_web_search_provider / emit /
+    subscribe / register_middleware，
     外加 plugin_id / has_plugin 两个只读查询。
     """
 
@@ -583,6 +590,48 @@ class PluginContext:
             registry.deregister(name)
 
         return self._track("tool", name, _release)
+
+    # -- 斜杠命令注册 ----------------------------------------------------
+
+    def register_command(
+        self,
+        command_name: str,
+        handler: Callable[[str], Optional[str]],
+        description: str = "",
+    ) -> PluginRegistration:
+        """注册一个 CLI 斜杠命令（对应原版 plugins.py:3200 精简版）。
+
+        2026-08 补回（disk-cleanup v2.0.0 依赖此 API，缺了整插件加载失败）。
+        命令名要求小写字母/数字/连字符（去 ``/`` 前缀后存储），handler 接收
+        命令剩余参数（空格分隔的原始串）并返回可选的输出文本；重复注册同名
+        命令时后注册者覆盖。cli 的 _dispatch_slash_command 在未知命令收口
+        前查表分发；卸载插件时自动移除。
+        """
+        if not isinstance(command_name, str) or not command_name.strip():
+            raise ValueError("command name must be a non-empty string")
+        name = command_name.strip().lower().lstrip("/")
+        if not name or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for ch in name):
+            raise ValueError(
+                "command name must use lowercase letters, digits, '-' or '_'"
+            )
+        if not callable(handler):
+            raise TypeError("command handler must be callable")
+
+        self._manager._plugin_commands[name] = {
+            "handler": handler,
+            "description": description or "",
+            "plugin": self.plugin_id,
+        }
+
+        def _release() -> None:
+            entry = self._manager._plugin_commands.get(name)
+            if entry is not None and entry.get("plugin") == self.plugin_id:
+                self._manager._plugin_commands.pop(name, None)
+
+        logger.debug(
+            "Plugin %s registered command: /%s", self.manifest.name, name
+        )
+        return self._track("command", name, _release)
 
     # -- memory provider 注册 --------------------------------------------
 
@@ -851,7 +900,8 @@ class PluginManager:
 
     持有四类表：已加载插件 ``_plugins``、钩子 ``_hooks``、中间件
     ``_middleware``、系统提示词段 ``_system_prompt_sections``，以及事件订阅
-    表 ``_subscriptions`` 与注册账本 ``_ownership_ledger``。首次 invoke_hook /
+    表 ``_subscriptions``、斜杠命令表 ``_plugin_commands`` 与注册账本
+    ``_ownership_ledger``。首次 invoke_hook /
     has_hook / render_system_prompt_sections 等入口会经模块级
     ``_delivery_manager`` 懒触发 discover_and_load。
     """
@@ -868,6 +918,10 @@ class PluginManager:
         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
         # 事件订阅表：{事件名: [_EventSubscription, ...]}，owner 标记便于卸载。
         self._subscriptions: Dict[str, List[_EventSubscription]] = {}
+        # 插件斜杠命令表：{命令名: {"handler": Callable, "description": str,
+        # "plugin": str}}。cli 的 _dispatch_slash_command 在未知命令收口前
+        # 查这张表（2026-08 为 disk-cleanup 补回 register_command 后引入）。
+        self._plugin_commands: Dict[str, Dict[str, Any]] = {}
         self._event_lock = threading.RLock()
         # 互发事件递归深度（thread-local，见 emit 说明）。
         self._emit_depth = threading.local()
@@ -1252,6 +1306,9 @@ class PluginManager:
                 ]
                 loaded.middleware_registered = [
                     r.key for r in owned if r.kind == "middleware"
+                ]
+                loaded.commands_registered = [
+                    r.key for r in owned if r.kind == "command"
                 ]
         except Exception as exc:
             owned = [
@@ -1821,6 +1878,20 @@ def has_middleware(kind: str) -> bool:
 def has_hook(hook_name: str) -> bool:
     """*hook_name* 是否有已加载插件处理（对应原版 plugins.py:5727）。"""
     return _delivery_manager().has_hook(hook_name)
+
+
+def get_plugin_commands() -> Dict[str, Dict[str, Any]]:
+    """返回已注册插件斜杠命令的只读快照（2026-08 补回 register_command 后新增）。
+
+    快照形如 ``{命令名: {"handler": Callable, "description": str, "plugin": str}}``，
+    供 cli 的 _dispatch_slash_command 在未知命令收口前查表分发。首次调用
+    触发懒发现，与 invoke_hook 语义一致。
+    """
+    manager = _delivery_manager()
+    return {
+        name: dict(entry)
+        for name, entry in manager._plugin_commands.items()
+    }
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple:

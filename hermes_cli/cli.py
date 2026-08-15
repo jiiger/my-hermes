@@ -704,6 +704,10 @@ def _dispatch_slash_command(
                     _regs.append(f"tools={', '.join(_p.tools_registered)}")
                 if _p.middleware_registered:
                     _regs.append(f"middleware={', '.join(_p.middleware_registered)}")
+                if _p.commands_registered:
+                    _regs.append(
+                        "commands=" + ", ".join(f"/{c}" for c in _p.commands_registered)
+                    )
                 if _regs:
                     print(f"      {'  '.join(_regs)}")
                 if _p.error:
@@ -711,6 +715,31 @@ def _dispatch_slash_command(
         except Exception as exc:
             print(f"⚠ 插件查询失败: {exc}")
         return "handled", history
+
+    # 插件注册的斜杠命令分发（register_command；2026-08 为 disk-cleanup
+    # 补回）。放在硬编码命令之后、未知命令收口之前：命令名取小写 cmd，
+    # 参数用 raw 原始串（路径等参数不能小写化）。
+    if raw.startswith("/"):
+        parts = cmd.split(maxsplit=1)
+        cmd_name = parts[0][1:]
+        try:
+            from hermes_cli.plugins import get_plugin_commands
+
+            entry = get_plugin_commands().get(cmd_name)
+        except Exception as exc:
+            print(f"⚠ 插件命令查询失败: {exc}")
+            return "handled", history
+        if entry is not None:
+            raw_parts = raw.strip().split(maxsplit=1)
+            arg_str = raw_parts[1] if len(raw_parts) > 1 else ""
+            try:
+                out = entry["handler"](arg_str)
+            except Exception as exc:
+                print(f"⚠ 插件命令 /{cmd_name} 执行失败: {exc}")
+            else:
+                if out:
+                    print(out)
+            return "handled", history
 
     if raw.startswith("/"):
         print(f"未知命令：{raw.split()[0]}（/help 查看可用命令）")
