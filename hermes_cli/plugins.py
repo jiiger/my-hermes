@@ -245,6 +245,8 @@ class PluginManifest:
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
+    # manifest 声明的 web provider 名列表（展示用，非强制）。
+    provides_web_providers: List[str] = field(default_factory=list)
     # manifest 声明的 hooks 列表（展示用，非强制）。
     hooks: List[str] = field(default_factory=list)
     # 加载顺序权重：数字小者先加载（同权重按 key 字母序）。
@@ -439,7 +441,7 @@ class PluginContext:
     只保留 11 个注册/查询方法：
     get_config / set_config / state / on_unload / register_tool /
     register_memory_provider / register_hook / register_system_prompt_section /
-    emit / subscribe / register_middleware，
+    register_web_search_provider / emit / subscribe / register_middleware，
     外加 plugin_id / has_plugin 两个只读查询。
     """
 
@@ -688,6 +690,53 @@ class PluginContext:
             "Plugin %s registered system prompt section: %s",
             self.manifest.name,
             id,
+        )
+        return handle
+
+    # -- web 搜索/提取 provider 注册 --------------------------------------
+
+    def register_web_search_provider(self, provider) -> Optional[PluginRegistration]:
+        """注册一个 web 搜索/提取后端。
+
+        ``provider`` 必须是
+        :class:`agent.web_search_provider.WebSearchProvider` 实例。它的
+        ``provider.name`` 是 ``web.search_backend`` / ``web.extract_backend`` /
+        ``web.backend`` 配置键匹配的标识，用于路由 ``web_search`` /
+        ``web_extract`` 工具调用。
+
+        注册表是模块级单例（agent.web_search_registry），不经过
+        PluginManager 的表——本方法只负责类型校验、写入注册表，并用
+        ``_track`` 记账（卸载时经 release 回调清理注册表条目）。
+        """
+        from agent.web_search_provider import WebSearchProvider
+        from agent.web_search_registry import (
+            _unregister_provider,
+            get_provider as _wsp_get_provider,
+            register_provider as _register_web_provider,
+        )
+
+        if not isinstance(provider, WebSearchProvider):
+            logger.warning(
+                "Plugin '%s' tried to register a web provider that does "
+                "not inherit from WebSearchProvider. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        registry_name = provider.name.strip()
+        _register_web_provider(provider)
+        # 确认写入生效且还是我们自己（覆盖注册可能被并发替换）。
+        if _wsp_get_provider(registry_name) is not provider:
+            return None
+
+        def _release() -> None:
+            # 只有注册表里当前还是自己时才弹出，防止误弹后来注册者。
+            if _wsp_get_provider(registry_name) is provider:
+                _unregister_provider(registry_name)
+
+        handle = self._track("web_search_provider", registry_name, _release)
+        logger.info(
+            "Plugin '%s' registered web provider: %s",
+            self.manifest.name, registry_name,
         )
         return handle
 
@@ -1155,6 +1204,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
+                provides_web_providers=data.get("provides_web_providers", []),
                 load_order=load_order,
                 **v2_fields,
             )
