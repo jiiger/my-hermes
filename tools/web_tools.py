@@ -26,9 +26,17 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
+from agent.redact import _PREFIX_RE
 from tools.registry import registry, tool_error
+from tools.url_safety import (
+    async_is_safe_url,
+    normalize_url_for_request,
+    sensitive_query_param_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +223,171 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return tool_error(f"Error searching web: {exc}")
 
 
+# ── web_extract 辅助（URL 归一化 / 安全 / 截断落盘）────────────────────────
+
+
+def _web_extract_url(value: Any) -> Optional[str]:
+    """从模型提供的提取项里取可用 URL。
+
+    模型有时会转发整个 web-search 结果而非其 URL。接受常见的两个 URL 键，
+    但拒绝缺失/非字符串值——不要为误导性的抓取目标 stringify 任意对象。
+    """
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("href")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+DEFAULT_EXTRACT_CHAR_LIMIT = 15000
+
+# 写入 cache/web 全文文件的上限。截断-落盘路径若不做上限，多 MB 页面会
+# 无界写盘。上限 2MB 远超任何单次 read_file 分页需要；模型只看到
+# char_limit 窗口，所以落盘副本被上限化不损失可用性。
+MAX_STORED_TEXT_CHARS = 2_000_000
+
+
+def _get_extract_char_limit() -> int:
+    """从配置解析每页字符预算，并钳制到合理区间。"""
+    try:
+        configured = _load_web_config().get("extract_char_limit")
+        if configured is not None:
+            value = int(configured)
+            # 下限 2k（再低 footer 会占大头），上限给宽松护栏防 typo 撑爆上下文。
+            return max(2000, min(value, 500_000))
+    except (TypeError, ValueError):
+        pass
+    return DEFAULT_EXTRACT_CHAR_LIMIT
+
+
+def convert_base64_images_to_links(text: str) -> str:
+    """把内联 base64 图片 blob 替换成带标签的 markdown 链接。
+
+    base64 图片载荷是 token 炸弹（单个内联 PNG 可达数万字符），绝不把原始
+    字节发给模型。但保留"这里曾有图"的事实与 alt 文本，作为可检查的占位符。
+    真实（http/https）markdown 图片链接保持不动，agent 可以继续
+    ``web_extract`` / ``vision_analyze`` 它们。
+
+    变换：
+      ``![alt](data:image/png;base64,AAAA...)``  -> ``[IMAGE: alt]``
+      ``(data:image/png;base64,AAAA...)``        -> ``[IMAGE]``
+      裸 ``data:image/...;base64,AAAA...``       -> ``[IMAGE]``
+    """
+    def _md_repl(m: "re.Match[str]") -> str:
+        alt = (m.group("alt") or "").strip()
+        return f"[IMAGE: {alt}]" if alt else "[IMAGE]"
+
+    md_b64 = re.compile(
+        r"!\[(?P<alt>[^\]]*)\]\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)"
+    )
+    out = md_b64.sub(_md_repl, text)
+
+    # 圆括号 base64（非 markdown）与裸 base64 → [IMAGE]
+    out = re.sub(r"\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)", "[IMAGE]", out)
+    out = re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "[IMAGE]", out)
+    return out
+
+
+def _store_full_text(url: str, content: str) -> Optional[str]:
+    """把提取到的完整页面写入 cache/web，返回其绝对路径。
+
+    落盘是 best-effort：失败只记 debug 并返回 None，截断后的内容照常返回。
+    """
+    try:
+        import hashlib
+        from urllib.parse import urlparse
+
+        from hermes_constants import get_hermes_dir
+
+        cache_dir = get_hermes_dir("cache/web", "web_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        host = (urlparse(url).hostname or "page").replace(":", "_")
+        slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+        path = cache_dir / f"{slug}-{digest}.md"
+        # 给病态大页面设上限，避免无界写盘。若被截断，追加标记让读文件者
+        # 知道这不是字面的完整页面。
+        if len(content) > MAX_STORED_TEXT_CHARS:
+            content = (
+                content[:MAX_STORED_TEXT_CHARS]
+                + f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
+                f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
+            )
+        from tools.spill_safety import write_text_exclusive
+
+        # 已知目录里的确定性文件名：经 lstat-unlink + 独占创建拒绝符号链接。
+        # 同一 URL 的再提取合法覆盖（同名 slug-digest）。非 private：
+        # cache/web 会被 bind-mount 进远端后端，容器 UID 必须能读。
+        write_text_exclusive(path, content, private=False, overwrite=True)
+        return str(path)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to store full web_extract text for %s: %s", url, exc)
+        return None
+
+
+def _truncate_with_footer(
+    content: str,
+    url: str,
+    char_limit: int,
+) -> tuple[str, bool]:
+    """返回单页干净内容的 (model_text, was_truncated)。
+
+    不超 ``char_limit`` 的页面原样返回。更大的页面取 head+tail 窗口
+    （约 75% head / 25% tail），尽量在 markdown 行边界切割，并附上明确
+    footer：告诉模型它看到多少、全文存在哪、哪个 read_file 调用翻页取
+    被省略的中间段。确定性——无模型参与。
+    """
+    if len(content) <= char_limit:
+        return content, False
+
+    head_budget = int(char_limit * 0.75)
+    tail_budget = char_limit - head_budget
+
+    head = content[:head_budget]
+    tail = content[-tail_budget:]
+    # head 切割回退到最后一个换行，避免断在行中间。
+    nl = head.rfind("\n")
+    if nl > head_budget * 0.5:
+        head = head[:nl]
+    # tail 切割前进到下一个换行，同样避免断行。
+    nl = tail.find("\n")
+    if 0 <= nl < tail_budget * 0.5:
+        tail = tail[nl + 1:]
+
+    total = len(content)
+    stored_path = _store_full_text(url, content)
+
+    footer_lines = [
+        "",
+        "─" * 8 + " [TRUNCATED] " + "─" * 8,
+        f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
+        f"of {total:,} total clean characters.",
+    ]
+    if stored_path:
+        # 被省略的中间段从我们展示的 head 之后开始。给模型一个具体起始行
+        # （head 行数 + 1），它的第一次 read_file 就能落在缺口而不是瞎猜
+        # <line>。read_file 从 1 计数；+1 越过已展示的 head 最后一行。
+        middle_start_line = head.count("\n") + 2
+        footer_lines.append(f"Full text saved to: {stored_path}")
+        footer_lines.append(
+            f'To read the omitted middle: read_file path="{stored_path}" '
+            f"offset={middle_start_line} limit=200  (the file is the complete page; "
+            f"raise/lower offset to page through it)."
+        )
+    else:
+        footer_lines.append(
+            "Full text could not be stored; re-run web_extract on a more "
+            "specific URL or use browser_navigate for the complete page."
+        )
+    footer_lines.append("─" * 29)
+
+    model_text = head + "\n\n[... middle omitted — see footer ...]\n\n" + tail
+    model_text += "\n" + "\n".join(footer_lines)
+    return model_text, True
+
+
 async def web_extract_tool(
     urls: List[Any],
     format: str = None,
@@ -222,16 +395,63 @@ async def web_extract_tool(
 ) -> str:
     """从指定 URL 提取内容并返回 JSON 结果字符串。
 
-    extract 后端（Firecrawl、Tavily、Exa、Parallel）返回干净、去样板的内容，
-    本工具直接返回不摘要。search-only 后端（ddgs / brave-free / searxng）
-    返回原版同款 "search-only backend" 错误。
+    流程：URL 归一化 → 内嵌密钥/敏感参数拦截 → SSRF 过滤 → 后端提取 →
+    顺序重建 → base64 图片转占位 + 超长截断 + 全文落盘 → 精简输出字段。
+    extract 后端（Tavily、Firecrawl、Exa、Parallel）返回干净、去样板的
+    内容，本工具直接返回不摘要。search-only 后端（ddgs / brave-free /
+    searxng）返回原版同款 "search-only backend" 错误。
 
     Args:
         urls: URL 字符串列表，或含 ``url`` / ``href`` 字符串字段的对象。
         format: 期望输出格式（"markdown" / "html"，可选）。
-        char_limit: 每页字符预算（可选，my-hermes 直接透传给 provider）。
+        char_limit: 每页字符预算（默认 web.extract_char_limit 或 15000）。
+            更大的页面 head+tail 截断，全文落盘到 cache/web。
     """
-    del char_limit  # my-hermes 裁剪截断/落盘，保留签名兼容
+    # ── 1. URL 归一化（非法项记 invalid_urls，不中断整体）───────────────
+    normalized_urls: List[str] = []
+    normalized_indices: List[int] = []
+    invalid_urls: Dict[int, Dict[str, Any]] = {}
+    for index, item in enumerate(urls):
+        _url = _web_extract_url(item)
+        if _url is None:
+            invalid_urls[index] = {
+                "url": "",
+                "title": "",
+                "content": "",
+                "error": (
+                    f"Invalid URL item at index {index}: expected a URL string "
+                    "or an object with a string 'url' or 'href' field"
+                ),
+            }
+            continue
+        normalized_url = normalize_url_for_request(_url)
+        # 内嵌密钥拦截（先 URL-decode，防百分号编码绕过 %73k- = sk-）。
+        if (
+            _PREFIX_RE.search(_url)
+            or _PREFIX_RE.search(unquote(_url))
+            or _PREFIX_RE.search(normalized_url)
+            or _PREFIX_RE.search(unquote(normalized_url))
+        ):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Blocked: URL contains what appears to be an API key or token. "
+                    "Secrets must not be sent in URLs."
+                ),
+            })
+        sensitive_query_key = sensitive_query_param_name(normalized_url)
+        if sensitive_query_key:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Blocked: URL contains a credential-like query parameter "
+                    f"({sensitive_query_key}). Web extract backends are third-party "
+                    "readers; remove the sensitive query parameter or use a local "
+                    "browser session when this access is explicitly required."
+                ),
+            })
+        normalized_urls.append(normalized_url)
+        normalized_indices.append(index)
 
     try:
         from tools.interrupt import is_interrupted
@@ -239,57 +459,147 @@ async def web_extract_tool(
         if is_interrupted():
             return tool_error("Interrupted", success=False)
 
-        _ensure_web_plugins_loaded()
-        from agent.web_search_registry import (
-            get_active_extract_provider,
-            get_provider as _wsp_get_provider,
-        )
+        logger.info("Extracting content from %d URL(s)", len(normalized_urls))
 
-        backend = _get_extract_backend()
-        provider = _wsp_get_provider(backend) if backend else None
-        if provider is None or not provider.supports_extract():
-            # 配置名已注册但不支持 extract（search-only 后端）→ 给出类型化
-            # 错误，而不是静默换后端；名字未注册则回退活动 provider 走查。
-            if provider is not None and not provider.supports_extract():
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": (
-                            f"{provider.display_name} is a search-only "
-                            "backend and cannot extract URL content. "
-                            "Set web.extract_backend to firecrawl, "
-                            "tavily, exa, or parallel."
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
-            provider = get_active_extract_provider()
-            if provider is None:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": (
-                            "No web extract provider configured. "
-                            "Set web.extract_backend to firecrawl, "
-                            "tavily, exa, or parallel."
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
+        # ── 2. SSRF 防护：任何后端之前过滤私网/内网 URL ──────────────────
+        safe_urls: List[str] = []
+        safe_indices: List[int] = []
+        ssrf_blocked: Dict[int, Dict[str, Any]] = {}
+        for index, url in zip(normalized_indices, normalized_urls):
+            if not await async_is_safe_url(url):
+                ssrf_blocked[index] = {
+                    "url": url, "title": "", "content": "",
+                    "error": "Blocked: URL targets a private or internal network address",
+                }
+            else:
+                safe_urls.append(url)
+                safe_indices.append(index)
 
-        logger.info("Web extract via %s: %d URL(s)", provider.name, len(urls))
-
-        # 同步/异步分派：async extract() 直接 await；同步 extract() 丢线程，
-        # 避免阻塞事件循环的网络 I/O。
-        if inspect.iscoroutinefunction(provider.extract):
-            results = await provider.extract(urls, format=format)
+        # ── 3. 只把安全 URL 派发给配置后端 ───────────────────────────────
+        if not safe_urls:
+            results: List[Dict[str, Any]] = []
         else:
-            results = await asyncio.to_thread(provider.extract, urls, format=format)
+            _ensure_web_plugins_loaded()
+            from agent.web_search_registry import (
+                get_active_extract_provider,
+                get_provider as _wsp_get_provider,
+            )
 
-        return json.dumps({"results": results}, ensure_ascii=False)
+            backend = _get_extract_backend()
+            provider = _wsp_get_provider(backend) if backend else None
+            if provider is None or not provider.supports_extract():
+                # 配置名已注册但不支持 extract（search-only 后端）→ 类型化
+                # 错误而非静默换后端；名字未注册则回退活动 provider 走查。
+                if provider is not None and not provider.supports_extract():
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"{provider.display_name} is a search-only "
+                                "backend and cannot extract URL content. "
+                                "Set web.extract_backend to firecrawl, "
+                                "tavily, exa, or parallel."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                provider = get_active_extract_provider()
+                if provider is None:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                "No web extract provider configured. "
+                                "Set web.extract_backend to firecrawl, "
+                                "tavily, exa, or parallel."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+
+            logger.info("Web extract via %s: %d URL(s)", provider.name, len(safe_urls))
+
+            # 同步/异步双派发：async extract() 直接 await；同步 extract() 丢
+            # 线程，避免阻塞事件循环的网络 I/O。
+            if inspect.iscoroutinefunction(provider.extract):
+                results = await provider.extract(safe_urls, format=format)
+            else:
+                results = await asyncio.to_thread(
+                    provider.extract, safe_urls, format=format,
+                )
+
+        # ── 4. 顺序重建：invalid / ssrf_blocked / 正常结果按原始 index 拼回 ──
+        if invalid_urls or ssrf_blocked:
+            safe_results = {
+                index: (
+                    results[position]
+                    if position < len(results)
+                    else {
+                        "url": safe_urls[position],
+                        "title": "",
+                        "content": "",
+                        "error": "Extract backend returned no result for this URL",
+                    }
+                )
+                for position, index in enumerate(safe_indices)
+            }
+            by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
+            results = [by_index[index] for index in range(len(urls))]
+
+        response = {"results": results}
+
+        # ── 5. 后处理：base64 转占位 + 超长截断 + 全文落盘 ───────────────
+        effective_char_limit = (
+            char_limit if char_limit is not None else _get_extract_char_limit()
+        )
+        try:
+            effective_char_limit = max(
+                2000, min(int(effective_char_limit), 500_000),
+            )
+        except (TypeError, ValueError):
+            effective_char_limit = DEFAULT_EXTRACT_CHAR_LIMIT
+
+        for result in response.get("results", []):
+            if result.get("error"):
+                continue
+            url = result.get("url", "")
+            raw_content = result.get("raw_content", "") or result.get("content", "")
+            if not raw_content:
+                continue
+            clean = convert_base64_images_to_links(raw_content)
+            model_text, truncated = _truncate_with_footer(
+                clean, url, effective_char_limit,
+            )
+            result["content"] = model_text
+            if truncated:
+                logger.info("%s (truncated %d -> %d chars)", url, len(clean), len(model_text))
+            else:
+                logger.info("%s (%d chars, whole)", url, len(clean))
+
+        # 精简输出字段：每条只留 url / title / content / error。
+        trimmed_results = [
+            {
+                "url": r.get("url", ""),
+                "title": r.get("title", ""),
+                "content": r.get("content", ""),
+                "error": r.get("error"),
+            }
+            for r in response.get("results", [])
+        ]
+        trimmed_response = {"results": trimmed_results}
+
+        if trimmed_response.get("results") == []:
+            result_json = tool_error("Content was inaccessible or not found")
+        else:
+            result_json = json.dumps(trimmed_response, indent=2, ensure_ascii=False)
+
+        # base64 占位已在单条后处理完成；这里对序列化 JSON 再扫一遍兜底，
+        # 防 provider 把 blob 塞进意外位置（如 metadata）。
+        cleaned_result = convert_base64_images_to_links(result_json)
+        return cleaned_result
     except Exception as exc:  # noqa: BLE001
         logger.debug("Web extract error: %s", exc)
-        return tool_error(f"Error extracting web content: {exc}")
+        return tool_error(f"Error extracting content: {exc}")
 
 
 # ── 工具 schema ──────────────────────────────────────────────────────────
